@@ -229,6 +229,10 @@ struct softkb_t {
     int           set_edit;
     char          set_edit_buf[CONFIG_STR_MAX];
     softkb_action_t set_action;
+
+    /* ── Window switcher (WIN button) ── */
+    char          win_label[8];     /* "2/3" — active/total */
+    int           win_total;
 };
 
 softkb_t *softkb_init(ime_t *ime) {
@@ -256,6 +260,13 @@ void softkb_set_config(softkb_t *kb, ssh_config_t *cfg) {
     if (cfg) kb->set_srv = cfg->active_server;
 }
 
+void softkb_set_win_info(softkb_t *kb, const char *label, int total) {
+    if (!kb) return;
+    snprintf(kb->win_label, sizeof(kb->win_label), "%s",
+             label ? label : "");
+    kb->win_total = total;
+}
+
 int softkb_in_settings(const softkb_t *kb) {
     return kb ? kb->settings_mode : 0;
 }
@@ -265,13 +276,19 @@ int softkb_settings_editing(const softkb_t *kb) {
 }
 
 /* Defined with the settings geometry below — needed early because
- * main.c routes bottom-row taps through it. */
+ * main.c routes bottom-row taps through them. */
 static int setbtn_hit(int tx, int ty);
+static int winbtn_hit(int tx, int ty);
 int softkb_settings_button_hit(const softkb_t *kb, int tx, int ty);
 
 int softkb_settings_button_hit(const softkb_t *kb, int tx, int ty) {
     (void)kb;
     return setbtn_hit(tx, ty);
+}
+
+int softkb_win_button_hit(const softkb_t *kb, int tx, int ty) {
+    (void)kb;
+    return winbtn_hit(tx, ty);
 }
 
 void softkb_free(softkb_t *kb) { free(kb); }
@@ -339,10 +356,16 @@ static int dbg_toggle_hit(int tx, int ty) {
 /* Pinned SET button — bottom-right corner of the bottom row (the strip
  * main.c owns for clock + mascot).  Drawn in normal AND settings mode;
  * hidden on the debug page. */
-#define SETBTN_W     34
+#define SETBTN_W     28
 #define SETBTN_H     22
-#define SETBTN_X     (320 - SETBTN_W - 2)    /* 284 */
+#define SETBTN_X     (320 - SETBTN_W - 2)    /* 290 */
 #define SETBTN_Y     (240 - SETBTN_H - 2)    /* 216 */
+
+/* Pinned WIN button — sits left of SET, switches SSH windows. */
+#define WINBTN_W     28
+#define WINBTN_H     22
+#define WINBTN_X     (SETBTN_X - WINBTN_W - 2)   /* 260 */
+#define WINBTN_Y     SETBTN_Y
 
 #define SET_TITLE_Y    40
 #define SET_SEL_Y      58
@@ -367,6 +390,11 @@ static int dbg_toggle_hit(int tx, int ty) {
 static int setbtn_hit(int tx, int ty) {
     return tx >= SETBTN_X && tx < SETBTN_X + SETBTN_W &&
            ty >= SETBTN_Y && ty < SETBTN_Y + SETBTN_H;
+}
+
+static int winbtn_hit(int tx, int ty) {
+    return tx >= WINBTN_X && tx < WINBTN_X + WINBTN_W &&
+           ty >= WINBTN_Y && ty < WINBTN_Y + WINBTN_H;
 }
 
 /* Field order = row order on the settings page. */
@@ -614,6 +642,17 @@ const char *softkb_touch(softkb_t *kb,
     if (kb->debug_mode) {
         if (down_edge && dbg_toggle_hit(tx, ty)) {
             kb->mascot_enabled = !kb->mascot_enabled;
+        }
+        kb->repeat_idx = -2;
+        return NULL;
+    }
+
+    /* ── Pinned WIN button: cycle SSH windows.  Normal keyboard mode
+     * only; a no-op (visually dimmed) while fewer than two servers are
+     * configured. ── */
+    if (winbtn_hit(tx, ty)) {
+        if (down_edge && kb->win_total >= 2) {
+            kb->set_action = SOFTKB_ACT_WIN_NEXT;
         }
         kb->repeat_idx = -2;
         return NULL;
@@ -1202,6 +1241,21 @@ static void draw_set_button(int active) {
                           active ? COL_KEY_PRESSED_FG : COL_KEY_LABEL);
 }
 
+/* Window switcher: shows the "2/3" active/total label when multiple
+ * servers are configured; renders dimmed "WIN" otherwise (taps are
+ * swallowed as no-ops in that case). */
+static void draw_win_button(const softkb_t *kb) {
+    int multi = kb && kb->win_total >= 2;
+    draw_key_button(WINBTN_X, WINBTN_Y, WINBTN_W, WINBTN_H,
+                    multi ? COL_KEY_BODY : COL_KEY_SPECIAL, 0);
+    const char *lbl = multi ? kb->win_label : "WIN";
+    int tw = (int)strlen(lbl) * CELL_W;
+    renderer_draw_text_px(WINBTN_X + (WINBTN_W - tw) / 2,
+                          WINBTN_Y + (WINBTN_H - CELL_H) / 2,
+                          lbl,
+                          multi ? COL_KEY_LABEL : COL_STATUS_DIM);
+}
+
 /* Reusable keyboard-layout painter (normal mode and settings edit mode). */
 static void draw_keyboard_keys(softkb_t *kb) {
     int n;
@@ -1345,5 +1399,6 @@ void softkb_draw(softkb_t *kb, renderer_t *r, const keyboard_t *kbd) {
 
     draw_status_row(kb, r, kbd);
     draw_keyboard_keys(kb);
+    draw_win_button(kb);
     draw_set_button(0);
 }

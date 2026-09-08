@@ -73,6 +73,11 @@
   servers, HOST/PORT/USER editing, **password login** or RSA pubkey,
   voice API URL, SAVE back to the SD card and one-tap RECONNECT.  No
   more hand-crafting config.ini.
+- **SSH windows (v1.3)** — a **WIN** button next to SET cycles through
+  the configured servers.  Background windows stay **online** (tmux and
+  vim keep running), switching is instant and independent.  Each window
+  owns a terminal (~0.6 MB incl. 500-line scrollback); four windows add
+  ~2.5 MB total — negligible on a 64 MB 3DS.
 - **HTTP voice API (v1.2)** — START recordings can go straight to a
   LAN speech-to-text server (e.g. mimo-voice-hub's `/api/stt`); the
   transcribed text lands in the terminal.  L+START AI ask still uses
@@ -625,6 +630,14 @@ slot activates it), HOST/PORT/USER/PASSWORD/KEY PATH rows (tap to
 edit; **A** commit, **B** backspace, **SELECT** cancel; AUTH row taps
 toggle key/password), VOICE API field, **SAVE** writes the config back
 to the SD card, **RECONNECT** drops the session and re-dials.
+
+**WIN button** (left of SET, v1.3): cycles through the configured
+servers.  Background windows stay connected and keep exchanging data
+(fish/tmux never stall on pending queries); the first visit to a
+window shows an empty terminal plus a "SELECT to connect" hint instead
+of silently starting a multi-second handshake — press **SELECT** to
+dial.  The WIN label shows the active window (`2/3`); it renders dimmed
+with a single configured server.
 
 ### Status bar (top 30 px)
 

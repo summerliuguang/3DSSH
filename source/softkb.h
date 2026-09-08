@@ -116,11 +116,16 @@ typedef enum {
     SOFTKB_ACT_NONE = 0,
     SOFTKB_ACT_SAVE,
     SOFTKB_ACT_RECONNECT,
+    SOFTKB_ACT_WIN_NEXT,
 } softkb_action_t;
 
 /* Hand softkb the config it should edit.  The pointer must outlive the
  * softkb (main.c keeps cfg on main()'s stack for the whole session). */
 void softkb_set_config(softkb_t *kb, ssh_config_t *cfg);
+
+/* Window-switcher state for the WIN button label ("2/3"); total < 2
+ * renders the button dimmed and taps become no-ops. */
+void softkb_set_win_info(softkb_t *kb, const char *label, int total);
 
 /* True iff the settings overlay replaces the keyboard right now. */
 int  softkb_in_settings(const softkb_t *kb);
@@ -133,6 +138,9 @@ int  softkb_settings_editing(const softkb_t *kb);
  * routes these taps to softkb_touch even though they're in the bottom
  * (mascot) row. */
 int  softkb_settings_button_hit(const softkb_t *kb, int tx, int ty);
+
+/* Same for the WIN window-switcher button next to it. */
+int  softkb_win_button_hit(const softkb_t *kb, int tx, int ty);
 
 /* Edit-mode key handling (main.c calls these on the key down-edges and
  * masks them from keyboard_handle_input). */

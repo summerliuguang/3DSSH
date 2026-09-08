@@ -61,6 +61,10 @@
   设置页——最多 4 台服务器、HOST/PORT/USER 直改、**密码登录**或
   RSA 公钥二选一、语音 API 直填；SAVE 写回 SD 卡、RECONNECT 一键
   换服务器重连。**不再需要手工准备 config.ini**。
+- **多窗口（v1.3 新增）**：键盘右下角 **WIN** 按钮循环切换已配置的
+  服务器窗口；后台窗口的 SSH 会话**保持在线**（tmux/vim 照常运行），
+  切换瞬时完成、互不干扰。每窗口一个独立终端（约 0.6 MB，含 500 行
+  scrollback），4 窗口总增量 ~2.5 MB，对 64 MB 内存的 3DS 毫无压力。
 - **HTTP 语音 API（v1.2 新增）**：START 的录音可改为直接 POST 给
   局域网转文字服务器（如 mimo-voice-hub 的 `/api/stt`），返回文字
   打进终端；`L+START` AI 问答仍走 SSH shim。
@@ -569,6 +573,12 @@ dssh-whisper switch         # 不带参数即 toggle
 PASSWORD/KEY PATH 点行进编辑（**A** 确认、**B** 退格、**SELECT**
 取消、AUTH 行点击即切换 key/password）、VOICE API 直填，**SAVE**
 写回 SD 卡，**RECONNECT** 断开并立即重连。
+
+**WIN 按钮**（SET 左侧，v1.3 新增）：循环切换已配置服务器的窗口。
+后台窗口的会话保持在线、持续收发（fish/tmux 不会卡在等待查询）；
+首次切到某窗口只显示空终端 + "SELECT to connect" 提示，不会偷偷
+发起可能卡几秒的握手——按 **SELECT** 才连接。WIN 标签显示当前
+窗口号（如 `2/3`），只配了一台服务器时置灰。
 
 ### 状态条（顶部 30 px）
 

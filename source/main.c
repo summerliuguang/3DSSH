@@ -172,21 +172,48 @@ static void net_fini(void) {
     if (soc_buf) { free(soc_buf); soc_buf = NULL; }
 }
 
-/* UTF-8 fragment buffer: SSH packet boundaries can split a multibyte char.
- * Stash up to 3 trailing bytes for the next read. */
-static char utf8_frag[4];
-static int  utf8_frag_len = 0;
+/* ── SSH windows ─────────────────────────────────────────────────────
+ * One window per configured server slot.  Each owns an independent
+ * terminal grid + UTF-8 fragment state; sessions stay connected in the
+ * background while another window is active.  Rendering and input
+ * routing go through the ACTIVE window (g_win[g_active]); background
+ * windows are only polled (non-blocking read + keepalive) so their
+ * shells keep running and their terminals stay current for instant
+ * switching — an unread background session would also hit libssh2 flow
+ * control and stall the remote shell. */
+typedef struct {
+    ssh_client_t *ssh;          /* NULL = never connected / torn down */
+    terminal_t   *term;         /* lazily created (~580 KB each) */
+    char          utf8_frag[4]; /* packet boundaries can split a UTF-8 char */
+    int           frag_len;
+    int           dead;         /* session lost — SELECT reconnects */
+    time_t        last_rx;      /* last receive, for the stall detector */
+} ssh_window_t;
 
-static void feed_terminal(terminal_t *term, const char *raw, int raw_len) {
+static ssh_window_t g_win[CONFIG_SERVERS_MAX];
+static int          g_active = 0;   /* active slot index */
+
+/* Window-button label "i/n" — both arguments clamped to the slot cap so
+ * the 8-byte buffers passed by callers can never truncate. */
+static void win_label(char *dst, size_t cap, int slot, int total) {
+    if (slot < 1) slot = 1;
+    if (slot > CONFIG_SERVERS_MAX) slot = CONFIG_SERVERS_MAX;
+    if (total < 1) total = 1;
+    if (total > CONFIG_SERVERS_MAX) total = CONFIG_SERVERS_MAX;
+    snprintf(dst, cap, "%d/%d", slot, total);
+}
+
+static void feed_terminal(terminal_t *term, char *frag, int *frag_len,
+                          const char *raw, int raw_len) {
     char buf[4 + READ_BUFSZ];
     int total;
-    if (utf8_frag_len > 0) {
-        memcpy(buf, utf8_frag, utf8_frag_len);
-        memcpy(buf + utf8_frag_len, raw, raw_len);
-        total = utf8_frag_len + raw_len;
-        utf8_frag_len = 0;
+    if (*frag_len > 0) {
+        memcpy(buf, frag, (size_t)*frag_len);
+        memcpy(buf + *frag_len, raw, (size_t)raw_len);
+        total = *frag_len + raw_len;
+        *frag_len = 0;
     } else {
-        memcpy(buf, raw, raw_len);
+        memcpy(buf, raw, (size_t)raw_len);
         total = raw_len;
     }
     int valid_end = total;
@@ -195,8 +222,8 @@ static void feed_terminal(terminal_t *term, const char *raw, int raw_len) {
         if (b >= 0xc0) {
             int seq_len = (b < 0xe0) ? 2 : (b < 0xf0) ? 3 : 4;
             if (total - j < seq_len) {
-                utf8_frag_len = total - j;
-                memcpy(utf8_frag, buf + j, utf8_frag_len);
+                *frag_len = total - j;
+                memcpy(frag, buf + j, (size_t)*frag_len);
                 valid_end = j;
             }
             break;
@@ -261,6 +288,7 @@ static void append_startup_tail(char *tail, int cap, int *tail_len,
  * reply. The alternate marker is optional; a return value of 1 means needle,
  * 2 means alternate, 0 means timeout, and -1 means SSH disconnected. */
 static int wait_for_remote_text_any(ssh_client_t *ssh, terminal_t *term,
+                                    char *frag, int *frag_len,
                                     const char *needle,
                                     const char *alternate,
                                     int timeout_ms,
@@ -288,7 +316,7 @@ static int wait_for_remote_text_any(ssh_client_t *ssh, terminal_t *term,
             continue;
         }
         append_startup_tail(tail, sizeof(tail), &tail_len, raw, n);
-        feed_terminal(term, raw, n);
+        feed_terminal(term, frag, frag_len, raw, n);
         flush_terminal_responses(ssh, term);
         char *found = strstr(tail, needle);
         char *found_alternate = alternate ? strstr(tail, alternate) : NULL;
@@ -306,9 +334,11 @@ static int wait_for_remote_text_any(ssh_client_t *ssh, terminal_t *term,
 }
 
 static int wait_for_remote_text(ssh_client_t *ssh, terminal_t *term,
+                                char *frag, int *frag_len,
                                 const char *needle, int timeout_ms,
                                 char *capture, int capture_sz) {
-    return wait_for_remote_text_any(ssh, term, needle, NULL, timeout_ms,
+    return wait_for_remote_text_any(ssh, term, frag, frag_len,
+                                    needle, NULL, timeout_ms,
                                     capture, capture_sz);
 }
 
@@ -346,6 +376,7 @@ static int parse_keychain_result(const char *capture,
  * its password prompt, then write the password.  An exec channel without a
  * PTY can fail with "User interaction is not allowed" on macOS. */
 static int unlock_macos_keychain(ssh_client_t *ssh, terminal_t *term,
+                                 char *frag, int *frag_len,
                                  const char *password,
                                  keychain_report_t *report,
                                  char *err, int err_sz) {
@@ -379,7 +410,7 @@ static int unlock_macos_keychain(ssh_client_t *ssh, terminal_t *term,
         snprintf(err, (size_t)err_sz, "shell readiness probe write failed");
         return -1;
     }
-    int rc = wait_for_remote_text(ssh, term, ready_marker,
+    int rc = wait_for_remote_text(ssh, term, frag, frag_len, ready_marker,
                                   SHELL_READY_TIMEOUT_MS,
                                   NULL, 0);
     if (rc <= 0) {
@@ -402,7 +433,8 @@ static int unlock_macos_keychain(ssh_client_t *ssh, terminal_t *term,
         snprintf(err, (size_t)err_sz, "unlock command write failed");
         return -1;
     }
-    rc = wait_for_remote_text_any(ssh, term, "password to unlock",
+    rc = wait_for_remote_text_any(ssh, term, frag, frag_len,
+                                  "password to unlock",
                                   result_marker,
                                   KEYCHAIN_PROMPT_TIMEOUT_MS,
                                   capture, sizeof(capture));
@@ -436,7 +468,7 @@ static int unlock_macos_keychain(ssh_client_t *ssh, terminal_t *term,
         return -1;
     }
 
-    rc = wait_for_remote_text(ssh, term, result_marker,
+    rc = wait_for_remote_text(ssh, term, frag, frag_len, result_marker,
                               KEYCHAIN_RESULT_TIMEOUT_MS,
                               capture, sizeof(capture));
     if (rc <= 0) {
@@ -483,44 +515,49 @@ static void render_connecting_frame(C3D_RenderTarget *top,
     C3D_FrameEnd(0);
 }
 
-/* Run the macOS keychain bootstrap on a freshly connected session, if a
+/* Run the macOS keychain bootstrap on a freshly connected window, if a
  * keychain password is configured (no-op otherwise).  Shared between the
- * initial connect and the SELECT-key reconnect, so a reconnected macOS
- * session gets its keychain unlocked again.  Returns the session pointer,
- * or NULL if a hard disconnect during bootstrap tore the session down. */
-static ssh_client_t *keychain_bootstrap(ssh_client_t *ssh,
+ * initial connect and every reconnect path (SELECT / SETTINGS), so a
+ * reconnected macOS session gets its keychain unlocked again.  Returns
+ * the window's session pointer, or NULL if a hard disconnect during
+ * bootstrap tore the session down. */
+static ssh_client_t *keychain_bootstrap(ssh_window_t *win,
                                         const ssh_config_t *cfg,
-                                        terminal_t *term, renderer_t *r,
+                                        renderer_t *r,
                                         softkb_t *kb, keyboard_t *kbd,
                                         C3D_RenderTarget *top,
                                         C3D_RenderTarget *bot,
                                         char *status_buf, int status_sz,
                                         uint32_t *status_color,
                                         char *err, int err_sz) {
+    ssh_client_t *ssh = win->ssh;
     if (!ssh || !cfg->macos_keychain_password[0]) return ssh;
 
     /* Keep this local-only progress line visible while bootstrap blocks,
      * then reset again so fish CPR uses remote coordinates. */
-    terminal_write(term, "\x1b[36mUnlocking macOS keychain...\x1b[0m\r\n");
-    render_connecting_frame(top, bot, r, term, kb, kbd);
-    terminal_reset(term);
+    terminal_write(win->term,
+                   "\x1b[36mUnlocking macOS keychain...\x1b[0m\r\n");
+    render_connecting_frame(top, bot, r, win->term, kb, kbd);
+    terminal_reset(win->term);
 
     keychain_report_t report = { -1, -1 };
     int unlock_rc = unlock_macos_keychain(
-        ssh, term, cfg->macos_keychain_password, &report, err, err_sz);
+        win->ssh, win->term, win->utf8_frag, &win->frag_len,
+        cfg->macos_keychain_password, &report, err, err_sz);
 
     /* ssh_read()/ssh_write() clear the connected flag on a hard error.
      * Do not leave a non-NULL but unusable session in the idle loop. */
-    if (!ssh_is_connected(ssh)) {
+    if (!ssh_is_connected(win->ssh)) {
         if (unlock_rc == 0)
             snprintf(err, (size_t)err_sz,
                      "SSH disconnected during keychain bootstrap");
         char line[320];
         snprintf(line, sizeof(line), "\x1b[31mSSH error:\x1b[0m %s\r\n", err);
-        terminal_write(term, line);
+        terminal_write(win->term, line);
         snprintf(status_buf, (size_t)status_sz, "ssh err");
         *status_color = COLOR_ERR;
-        ssh_disconnect(ssh);
+        ssh_disconnect(win->ssh);
+        win->ssh = NULL;
         return NULL;
     }
     if (unlock_rc != 0) {
@@ -530,14 +567,14 @@ static ssh_client_t *keychain_bootstrap(ssh_client_t *ssh,
             /* A prompt/result timeout can leave `security` owning the
              * foreground PTY. Abort it before handing control to the
              * user so keyboard input reaches the normal shell. */
-            (void)startup_write_all(ssh, "\x03\n", 2, 2000);
+            (void)startup_write_all(win->ssh, "\x03\n", 2, 2000);
             char line[320];
             snprintf(line, sizeof(line),
                      "\x1b[33mkeychain bootstrap failed:\x1b[0m %s\r\n", err);
-            terminal_write(term, line);
+            terminal_write(win->term, line);
         }
     }
-    return ssh;
+    return win->ssh;
 }
 
 /* Snap the local terminal view to the bottom (canceling any user-side
@@ -554,20 +591,21 @@ static void send_to_ssh(ssh_client_t *ssh, terminal_t *term,
     if (mc) mascot_type_kick(mc);
 }
 
-/* Establish (or re-establish) the SSH session using the loaded config.
- * Used both for the initial connect at startup and for the SELECT-key
- * reconnect after a hard disconnect (lid-close sleep kills the TCP).
- * On success: returns a new ssh_client_t, resets the local terminal
- * (fish CPR needs remote coordinates), sizes the PTY and sets a status
- * string.  On failure: returns NULL, writes the red SSH-error banner +
- * the diagnostic in err.  Dispatches on the active server's auth mode:
- * "password" servers use ssh_connect_password, everything else publickey. */
-static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
+/* Establish (or re-establish) the SSH session for server slot `slot`.
+ * Used for the initial connect (slot 0), the SELECT-key reconnect of the
+ * active window and the SETTINGS RECONNECT button.  On success: returns
+ * a new ssh_client_t, resets the window's local terminal (fish CPR needs
+ * remote coordinates), sizes the PTY and sets a status string.  On
+ * failure: returns NULL, writes the red SSH-error banner + the
+ * diagnostic in err.  Dispatches on the slot's auth mode: "password"
+ * servers use ssh_connect_password, everything else publickey. */
+static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg, int slot,
                                    ts3ds *tailscale,
                                    terminal_t *term,
                                    char *status_buf, int status_sz,
                                    char *err, int err_sz) {
-    const ssh_server_t *srv = config_active_const(cfg);
+    if (slot < 0 || slot >= cfg->server_count) slot = 0;
+    const ssh_server_t *srv = &cfg->servers[slot];
     ssh_client_t *ssh;
     if (srv->auth == SSH_AUTH_PASSWORD) {
         ssh = ssh_connect_password(srv->host, srv->port, srv->user,
@@ -601,15 +639,15 @@ static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
 }
 
 /* Shared by the SELECT-key reconnect and the SETTINGS-page RECONNECT
- * button.  The caller must have torn down any old session first (voice
- * abort + ssh_disconnect + ssh = NULL).  Renders a "Reconnecting..."
- * frame (so the banner is visible during the blocking handshake), dials
- * with the current config and re-runs the keychain bootstrap.  Returns
- * the new session or NULL; on success the caller clears ssh_dead and
- * celebrates. */
-static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg,
+ * button.  The caller must have torn down the window's old session
+ * first (voice abort + ssh_disconnect + win->ssh = NULL).  Renders a
+ * "Reconnecting..." frame (so the banner is visible during the blocking
+ * handshake), dials the window's server slot and re-runs the keychain
+ * bootstrap.  Returns the new session or NULL; on success the caller
+ * clears the window's dead flag and celebrates. */
+static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg, int slot,
                                        ts3ds *tailscale,
-                                       terminal_t *term,
+                                       ssh_window_t *win,
                                        renderer_t *r,
                                        softkb_t *kb,
                                        keyboard_t *kbd,
@@ -619,7 +657,7 @@ static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg,
                                        char *status_buf, int status_sz,
                                        uint32_t *status_color,
                                        char *err, int err_sz) {
-    terminal_write(term, "\x1b[33mReconnecting...\x1b[0m\r\n");
+    terminal_write(win->term, "\x1b[33mReconnecting...\x1b[0m\r\n");
     /* Put the crab into its "looking up / waiting" pose before we flush
      * the frame below, so the user sees it react. */
     mascot_set_reconnecting(mc, 1);
@@ -628,12 +666,12 @@ static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg,
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
     C2D_SceneBegin(top);
-    renderer_draw_terminal(r, term);
+    renderer_draw_terminal(r, win->term);
     C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
     C2D_SceneBegin(bot);
     softkb_draw(kb, r, kbd);
-    /* Bottom row: clock + mascot, mirroring the main render path so the
-     * reconnect frame isn't missing anything. */
+    /* Bottom row: clock + window/mascot buttons + mascot, mirroring the
+     * main render path so the reconnect frame isn't missing anything. */
     if (!softkb_in_debug(kb)) {
         char clock_buf[24];
         time_t now = time(NULL);
@@ -648,13 +686,13 @@ static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg,
     }
     C3D_FrameEnd(0);
 
-    ssh_client_t *ssh = reconnect_ssh(cfg, tailscale, term,
+    ssh_client_t *ssh = reconnect_ssh(cfg, slot, tailscale, win->term,
                                       status_buf, status_sz,
                                       err, err_sz);
     /* Reconnected to a macOS host: its login keychain locked again with
      * the old session — unlock it again so Claude Code keeps finding
      * its credentials. */
-    ssh = keychain_bootstrap(ssh, cfg, term, r, kb, kbd, top, bot,
+    ssh = keychain_bootstrap(win, cfg, r, kb, kbd, top, bot,
                              status_buf, status_sz, status_color,
                              err, err_sz);
     mascot_set_reconnecting(mc, 0);
@@ -665,7 +703,13 @@ int main(int argc, char *argv[]) {
     char err[256] = {0};
     char status_buf[80] = "starting...";
     uint32_t status_color = COLOR_WARN;
+    /* `ssh` / `term` are aliases of the ACTIVE window's session and
+     * terminal; they are re-synced on window switches, reconnects and
+     * disconnects.  Window 0's terminal exists from the start (early
+     * banners + the first connection live there); other windows are
+     * created lazily on first switch (~580 KB each). */
     ssh_client_t *ssh = NULL;
+    terminal_t *term = NULL;
     ts3ds *tailscale = NULL;
     static tailscale_debug_log tailscale_debug;
     tailscale_debug_init(&tailscale_debug);
@@ -686,34 +730,46 @@ int main(int argc, char *argv[]) {
     ssh_config_t cfg;
     int loaded = config_load(&cfg, CONFIG_PATH);
     snprintf(status_buf, sizeof(status_buf),
-             loaded ? "config: SD" : "config: defaults");    /* Seed RNG so the mascot's idle/walk transitions don't repeat across
+             loaded ? "config: SD" : "config: defaults");
+
+    /* Seed RNG so the mascot's idle/walk transitions don't repeat across
      * runs.  time(NULL) is fine — we don't need cryptographic randomness. */
     srand((unsigned)time(NULL));
 
     /* ── Sub-systems ── */
-    terminal_t *term = terminal_init(R_TOP_COLS, R_TOP_ROWS);
+    /* Window 0 owns the early banners and the boot connection; its
+     * terminal is created here.  `term` stays an alias of the ACTIVE
+     * window's terminal for the rest of main(). */
+    g_win[0].term = terminal_init(R_TOP_COLS, R_TOP_ROWS);
+    term = g_win[0].term;
     renderer_t *r    = renderer_init(top, bot);
     keyboard_t *kbd  = keyboard_init();
     /* Mascot lives in the bottom row (y=214..239, 26 px tall).  Clock
-     * occupies x=2..67 on the left; mascot scampers in x=72..278 on
-     * the right — the pinned SET button owns x=284..318.  Crab is
-     * 11 px tall (10-row body + 1-row feet) so y_top = 214 + (26-11)/2
-     * = 221 centers it in the row. */
-    mascot_t   *mc   = mascot_init(72, 278, 221);
+     * occupies x=2..67 on the left; mascot scampers in x=72..254 — the
+     * pinned WIN (x=260..288) and SET (x=290..318) buttons own the right
+     * corner.  Crab is 11 px tall (10-row body + 1-row feet) so
+     * y_top = 214 + (26-11)/2 = 221 centers it in the row. */
+    mascot_t   *mc   = mascot_init(72, 254, 221);
     /* IME loads later (after the M7 banner pumps); softkb tolerates
      * a NULL ime by falling back to passthrough in CN mode. */
     ime_t      *ime  = NULL;
     softkb_t   *kb   = softkb_init(NULL);
     /* Voice input: physical START toggles record/transcribe.  Server
      * needs `dssh-whisper-shim` on PATH (installed by
-     * tools/install_whisper_server.sh).  voice_t is allocated up-front;
-     * mic only opens during the RECORDING state. */
+     * tools/install_whisper_server.sh), or an HTTP voice API endpoint in
+     * the config.  voice_t is allocated up-front; mic only opens during
+     * the RECORDING state. */
     voice_t    *voice = voice_init();
     if (kb && voice) softkb_set_voice(kb, voice);
     /* SETTINGS page edits cfg in place; SAVE persists it to the SD card
      * and refreshes the voice API endpoint. */
     if (kb) softkb_set_config(kb, &cfg);
     voice_set_api(voice, cfg.voice_api_url);
+    {
+        char wl[8];
+        win_label(wl, sizeof(wl), g_active + 1, cfg.server_count);
+        softkb_set_win_info(kb, wl, cfg.server_count);
+    }
     /* M12: AI-ask modal — pops over the soft keyboard when the user
      * presses L+START and a Q&A returns from DeepSeek. */
     ai_modal_t *aim   = ai_modal_init();
@@ -843,14 +899,17 @@ int main(int argc, char *argv[]) {
      * the SSH handshake blocks the main loop. */
     render_connecting_frame(top, bot, r, term, kb, kbd);
 
-    ssh = reconnect_ssh(&cfg, tailscale, term, status_buf, sizeof(status_buf),
-                        err, sizeof(err));
+    ssh = reconnect_ssh(&cfg, 0, tailscale, term, status_buf,
+                        sizeof(status_buf), err, sizeof(err));
+    g_win[0].ssh = ssh;
+    if (!ssh) g_win[0].dead = 1;
+    g_win[0].last_rx = time(NULL);
 
     tailscale_debug_set_runtime(&tailscale_debug);
     tailscale_debug_flush(&tailscale_debug, term);
     status_color = ssh ? COLOR_OK : COLOR_ERR;
 
-    ssh = keychain_bootstrap(ssh, &cfg, term, r, kb, kbd, top, bot,
+    ssh = keychain_bootstrap(&g_win[0], &cfg, r, kb, kbd, top, bot,
                              status_buf, sizeof(status_buf), &status_color,
                              err, sizeof(err));
 
@@ -863,20 +922,17 @@ idle_loop:
     {
         char rbuf[READ_BUFSZ];
 
-        /* ALERT triggers (mascot raises the red ✕):
+        /* ALERT triggers (mascot raises the red ✕), tracked for the
+         * ACTIVE window:
          *
          *  - Interactive-stall (5 s): user sent bytes more recently than
          *    we've received any reply, and no reply has come for 5 s.
          *    Means the user is actively waiting and not getting through.
          *
-         *  - Hard disconnect: ssh_read returned < 0 — libssh2 detected
-         *    the socket is dead.  Once this fires we never recover in-
-         *    session (no auto-reconnect logic), so the alert stays on
-         *    until the user exits and relaunches DSSH.  Replaces the
-         *    old "[disconnected]" terminal banner. */
+         *  - Dead session: ssh_read returned < 0 or the window was never
+         *    connected.  The alert stays on until SELECT reconnects. */
         const int STALL_TX_NORX_S = 5;
-        time_t last_rx_at = time(NULL);
-        g_last_tx_at      = last_rx_at;
+        g_last_tx_at      = time(NULL);
         int    stall_alert = 0;
         int    ssh_dead    = ssh ? 0 : 1;
 
@@ -971,34 +1027,43 @@ idle_loop:
                 mascot_type_kick(mc);
             }
 
-            /* ── SSH receive ── */
-            if (ssh && ssh_is_connected(ssh)) {
-                ssh_keepalive_tick(ssh);
-                int n = ssh_read(ssh, rbuf, sizeof(rbuf));
+            /* ── SSH receive — EVERY window, so background shells keep
+             * running and their terminals stay current for instant
+             * switching.  This is also a flow-control requirement: a
+             * background session whose output is left unread fills its
+             * libssh2 window and the remote process blocks. ── */
+            for (int wi = 0; wi < cfg.server_count; wi++) {
+                ssh_window_t *w = &g_win[wi];
+                if (!w->ssh || !ssh_is_connected(w->ssh)) continue;
+                ssh_keepalive_tick(w->ssh);
+                int n = ssh_read(w->ssh, rbuf, sizeof(rbuf));
                 if (n > 0) {
-                    /* Capture for the debug page's recv-ring before the
-                     * UTF-8 reassembler can chop the buffer up. */
-                    softkb_record_recv(kb, rbuf, n);
-                    feed_terminal(term, rbuf, n);
+                    /* Debug recv-ring only traces the visible window. */
+                    if (wi == g_active) softkb_record_recv(kb, rbuf, n);
+                    feed_terminal(w->term, w->utf8_frag, &w->frag_len,
+                                  rbuf, n);
                     /* Interactive shells such as fish query cursor/device
                      * state and wait for the terminal emulator to reply.
-                     * Return any responses queued by terminal_write_n(). */
-                    flush_terminal_responses(ssh, term);
-                    last_rx_at = time(NULL);
+                     * Background windows must answer too, or their shell
+                     * stalls on a pending query. */
+                    flush_terminal_responses(w->ssh, w->term);
+                    w->last_rx = time(NULL);
                 } else if (n < 0) {
-                    /* Hard disconnect.  Abort any in-flight voice work
-                     * (its aux channel dies with the session), tear down
-                     * the session, mark it dead so the mascot raises ✕,
-                     * and show a one-shot red banner telling the user how
-                     * to recover (SELECT reconnect).  Only fires on the
-                     * 0→1 transition of ssh_dead — no per-frame spam. */
-                    voice_abort(voice);
-                    ssh_disconnect(ssh);
-                    ssh = NULL;
-                    ssh_dead = 1;
-                    terminal_write(term,
-                        "\r\n\x1b[31mConnection lost\r\n\x1b[0m"
-                        "\x1b[33mPress SELECT to reconnect\r\n\x1b[0m");
+                    /* Hard disconnect.  Tear the session down and mark
+                     * the window dead.  For the ACTIVE window this also
+                     * aborts in-flight voice work (its aux channel dies
+                     * with the session) and shows the recovery banner. */
+                    ssh_disconnect(w->ssh);
+                    w->ssh = NULL;
+                    w->dead = 1;
+                    if (wi == g_active) {
+                        voice_abort(voice);
+                        ssh = NULL;
+                        ssh_dead = 1;
+                        terminal_write(w->term,
+                            "\r\n\x1b[31mConnection lost\r\n\x1b[0m"
+                            "\x1b[33mPress SELECT to reconnect\r\n\x1b[0m");
+                    }
                 }
             }
 
@@ -1017,7 +1082,7 @@ idle_loop:
             if (!voice_busy) {
                 int interactive_stall =
                     ssh && ssh_is_connected(ssh) &&
-                    g_last_tx_at > last_rx_at &&
+                    g_last_tx_at > g_win[g_active].last_rx &&
                     (now_t - g_last_tx_at) > STALL_TX_NORX_S;
                 int want_alert = ssh_dead || interactive_stall;
                 if (want_alert != stall_alert) {
@@ -1026,12 +1091,12 @@ idle_loop:
                 }
             }
 
-            /* ── SELECT reconnect (only when the session is dead) ──
-             * A hard disconnect (lid-close sleep) leaves ssh_dead=1.
-             * Pressing SELECT here reuses the loaded config to open a
-             * fresh session, so the user recovers without relaunching.
-             * While connected, SELECT falls through to keyboard_handle_input
-             * as Esc (see the input_down mask below).
+            /* ── SELECT reconnect (only when the active window's session
+             * is dead) ── A hard disconnect (lid-close sleep) leaves
+             * ssh_dead=1.  Pressing SELECT re-dials the ACTIVE window's
+             * server slot, so the user recovers without relaunching.
+             * While connected, SELECT falls through to
+             * keyboard_handle_input as Esc (see the input_down mask).
              *
              * select_consumed records that THIS frame's SELECT triggered
              * a reconnect.  It can't be derived from ssh_dead because a
@@ -1042,16 +1107,18 @@ idle_loop:
             int select_consumed = 0;
             if (ssh_dead && !modal_open && !set_edit && (down & KEY_SELECT)) {
                 select_consumed = 1;
-                ssh = attempt_reconnect(&cfg, tailscale, term, r, kb, kbd,
-                                        mc, top, bot,
+                ssh = attempt_reconnect(&cfg, g_active, tailscale,
+                                        &g_win[g_active],
+                                        r, kb, kbd, mc, top, bot,
                                         status_buf, sizeof(status_buf),
                                         &status_color, err, sizeof(err));
                 if (ssh) {
-                    ssh_dead    = 0;
+                    g_win[g_active].dead = 0;
+                    g_win[g_active].ssh  = ssh;
+                    g_win[g_active].last_rx = time(NULL);
                     stall_alert = 0;
                     mascot_celebrate(mc);
-                    last_rx_at  = time(NULL);
-                    g_last_tx_at = last_rx_at;
+                    g_last_tx_at = time(NULL);
                 } else {
                     mascot_sadden(mc);
                     terminal_write(term,
@@ -1103,9 +1170,10 @@ idle_loop:
                     ai_modal_close(aim);
                 }
             } else if (touch_down && ty >= 214 && show_mascot &&
-                       !softkb_settings_button_hit(kb, tx, ty)) {
-                /* The pinned SET button sits in the mascot's row —
-                 * route its taps to softkb, the rest go to the crab. */
+                       !softkb_settings_button_hit(kb, tx, ty) &&
+                       !softkb_win_button_hit(kb, tx, ty)) {
+                /* The pinned WIN/SET buttons sit in the mascot's row —
+                 * route their taps to softkb, the rest go to the crab. */
                 if (mascot_hit_test(mc, tx, ty))
                     mascot_on_touched(mc, tx);
             } else {
@@ -1136,6 +1204,10 @@ idle_loop:
                 if (act == SOFTKB_ACT_SAVE) {
                     if (config_save(&cfg, CONFIG_PATH) == 0) {
                         voice_set_api(voice, cfg.voice_api_url);
+                        char wl[8];
+                        win_label(wl, sizeof(wl),
+                                  g_active + 1, cfg.server_count);
+                        softkb_set_win_info(kb, wl, cfg.server_count);
                         terminal_write(term,
                             "\x1b[32msettings saved to SD\x1b[0m\r\n");
                     } else {
@@ -1149,22 +1221,71 @@ idle_loop:
                         ssh_disconnect(ssh);
                         ssh = NULL;
                     }
+                    g_win[g_active].ssh  = NULL;
                     ssh_dead = 1;
-                    ssh = attempt_reconnect(&cfg, tailscale, term, r, kb,
-                                            kbd, mc, top, bot,
+                    ssh = attempt_reconnect(&cfg, g_active, tailscale,
+                                            &g_win[g_active],
+                                            r, kb, kbd, mc, top, bot,
                                             status_buf, sizeof(status_buf),
                                             &status_color, err, sizeof(err));
                     if (ssh) {
+                        g_win[g_active].ssh  = ssh;
+                        g_win[g_active].dead = 0;
+                        g_win[g_active].last_rx = time(NULL);
                         ssh_dead    = 0;
                         stall_alert = 0;
                         mascot_celebrate(mc);
-                        last_rx_at   = time(NULL);
-                        g_last_tx_at = last_rx_at;
+                        g_last_tx_at = time(NULL);
                     } else {
                         mascot_sadden(mc);
                         terminal_write(term,
                             "\x1b[31mReconnect failed; press SELECT to "
                             "retry.\x1b[0m\r\n");
+                    }
+                } else if (act == SOFTKB_ACT_WIN_NEXT) {
+                    /* Cycle to the next configured slot that has a host.
+                     * Switching is instant: the target terminal is created
+                     * empty on first visit and connects only when the user
+                     * presses SELECT there (no surprise blocking
+                     * handshakes mid-cycle). */
+                    int next = g_active, tries = 0;
+                    do {
+                        next = (next + 1) % cfg.server_count;
+                        tries++;
+                    } while (next != g_active &&
+                             !cfg.servers[next].host[0] &&
+                             tries < CONFIG_SERVERS_MAX);
+                    if (next != g_active && cfg.servers[next].host[0]) {
+                        g_active = next;
+                        ssh = g_win[next].ssh;
+                        if (!g_win[next].term) {
+                            g_win[next].term =
+                                terminal_init(R_TOP_COLS, R_TOP_ROWS);
+                            char hdr[160];
+                            const ssh_server_t *ns = &cfg.servers[next];
+                            int rc = snprintf(hdr, sizeof(hdr),
+                                     "\x1b[90m── window %d: "
+                                     "%.36s@%.44s:%d ──\x1b[0m\r\n",
+                                     next + 1, ns->user, ns->host, ns->port);
+                            if (rc > 0 && rc < (int)sizeof(hdr))
+                                terminal_write(g_win[next].term, hdr);
+                            if (!ssh)
+                                terminal_write(g_win[next].term,
+                                    "\x1b[33moffline — SELECT to "
+                                    "connect\x1b[0m\r\n");
+                        }
+                        term = g_win[next].term;
+                        ssh_dead = (ssh == NULL);
+                        stall_alert = 0;
+                        char wl[8];
+                        win_label(wl, sizeof(wl),
+                                  g_active + 1, cfg.server_count);
+                        softkb_set_win_info(kb, wl, cfg.server_count);
+                        if (ssh) {
+                            /* Resync per-window stall tracking. */
+                            g_last_tx_at = time(NULL);
+                        }
+                        mascot_set_alert(mc, ssh_dead);
                     }
                 }
             }
@@ -1210,11 +1331,17 @@ idle_loop:
             C3D_FrameEnd(0);
         }
 
-        /* Release voice's aux channel BEFORE freeing the session —
+        /* Release voice's aux channel BEFORE freeing the sessions —
          * voice_free → release_aux would otherwise call libssh2_channel_*
-         * on a freed LIBSSH2_SESSION (use-after-free). */
+         * on a freed LIBSSH2_SESSION (use-after-free).  Then tear down
+         * EVERY window's session — background shells die with the app. */
         voice_abort(voice);
-        if (ssh) ssh_disconnect(ssh);
+        for (int i = 0; i < cfg.server_count; i++) {
+            if (g_win[i].ssh) {
+                ssh_disconnect(g_win[i].ssh);
+                g_win[i].ssh = NULL;
+            }
+        }
     }
     if (tailscale) {
         ts3ds_close(tailscale);
@@ -1240,6 +1367,13 @@ cleanup:
                  sizeof(cfg.macos_keychain_password));
     clear_secret(cfg.tailscale_auth_key,
                  sizeof(cfg.tailscale_auth_key));
+    /* Per-window terminals (window 0's included — `term` is an alias). */
+    for (int i = 0; i < CONFIG_SERVERS_MAX; i++) {
+        if (g_win[i].term) {
+            terminal_free(g_win[i].term);
+            g_win[i].term = NULL;
+        }
+    }
     if (aim)   ai_modal_free(aim);
     if (voice) voice_free(voice);
     if (ime)  ime_free(ime);
@@ -1247,7 +1381,6 @@ cleanup:
     if (kb)   softkb_free(kb);
     if (kbd)  keyboard_free(kbd);
     if (r)    renderer_free(r);
-    if (term) terminal_free(term);
     if (romfs_ok) romfsExit();
     C2D_Fini();
     C3D_Fini();
