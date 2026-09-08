@@ -68,6 +68,15 @@
   yellow, code in cyan, bullets, etc.) without disturbing the SSH
   session above.  Press **A** in the modal to keep history for follow-
   up questions, **B** to clear and start a new conversation.
+- **On-device multi-server settings (v1.2)** — a **SET** button pinned
+  to the keyboard's bottom-right opens a settings page: up to 4
+  servers, HOST/PORT/USER editing, **password login** or RSA pubkey,
+  voice API URL, SAVE back to the SD card and one-tap RECONNECT.  No
+  more hand-crafting config.ini.
+- **HTTP voice API (v1.2)** — START recordings can go straight to a
+  LAN speech-to-text server (e.g. mimo-voice-hub's `/api/stt`); the
+  transcribed text lands in the terminal.  L+START AI ask still uses
+  the SSH shim.
 - **RSA-4096 public-key auth** — libssh2 + mbedTLS, private key read
   from the SD card.
 - **Native Tailscale transport** — optionally join the 3DS to a tailnet and
@@ -177,15 +186,36 @@ Copy the **private key** `~/.ssh/id_rsa_3ds` onto the SD card at
 
 ## Configure config.ini
 
-Copy `sd_template/3ds/3dssh/config.ini.example` to the SD card at
-`/3ds/3dssh/config.ini` and edit the values:
+**Since v1.2 you can configure everything on the 3DS itself**: tap the
+**SET** button pinned to the bottom-right of the keyboard to open the
+settings page (up to 4 servers, `< SRV n/4 >` selector — browsing to a
+configured slot also selects it; tap a row to edit, **A** commit /
+**B** backspace / **SELECT** cancel), then **SAVE** writes the file back
+to the SD card and **RECONNECT** re-dials immediately.
+
+Hand-editing still works — copy `sd_template/3ds/3dssh/config.ini.example`
+to the SD card at `/3ds/3dssh/config.ini` and edit the values:
 
 ```ini
-host       = your-server.example.com
-port       = 22
-user       = ubuntu
-key_path   = sdmc:/3ds/3dssh/id_rsa
-passphrase =
+# Servers 1..4; server1 uses RSA pubkey, server2 uses a password
+server1_host = your-server.example.com
+server1_port = 22
+server1_user = ubuntu
+server1_auth = key
+server1_key_path = sdmc:/3ds/3dssh/id_rsa
+server1_passphrase =
+
+server2_host = 192.0.2.10
+server2_port = 22
+server2_user = root
+server2_auth = password
+server2_password = change-me
+
+# Which server to connect to at boot (1-based)
+active_server = 1
+
+# Optional: HTTP voice-transcription endpoint — see "Voice input"
+voice_api_url =
 
 # Optional: unlock the current SSH user's macOS login keychain
 macos_keychain_password =
@@ -199,16 +229,20 @@ tailscale_control_url = https://controlplane.tailscale.com
 
 | Field | Meaning |
 |---|---|
-| `host` | Server IP or hostname |
-| `port` | Port (default 22) |
-| `user` | SSH login user |
-| `key_path` | Private key path; `sdmc:/...` is the 3DS standard SD prefix |
-| `passphrase` | Optional key passphrase; leave empty (typing one on the soft keyboard is awkward) |
+| `serverN_host` / `serverN_port` / `serverN_user` | Address, port (default 22), and login user of server N |
+| `serverN_auth` | `key` (default, RSA pubkey) or `password` |
+| `serverN_key_path` / `serverN_passphrase` | Private key path and passphrase; `sdmc:/...` is the 3DS standard SD prefix |
+| `serverN_password` | Login password for password auth (stored in plaintext on the SD card — mind physical security) |
+| `active_server` | Server index to connect to at boot (1-based) |
+| `voice_api_url` | HTTP speech-to-text endpoint; empty = classic SSH-shim transport |
 | `macos_keychain_password` | Optional macOS login password; setting it enables automatic unlock for the current SSH user |
 | `tailscale_auth_key` | Auth key used for registration; setting it enables Tailscale automatically |
 | `tailscale_hostname` | Device name shown in the tailnet |
 | `tailscale_state` | Persistent machine/WireGuard/DISCO identity file |
 | `tailscale_control_url` | Coordination server; defaults to Tailscale SaaS |
+
+> The legacy flat keys (`host =` / `port =` / `user =` / `key_path =` /
+> `passphrase =`) are still accepted and map to server 1.
 
 When `macos_keychain_password` is set, DSSH waits for the current interactive PTY
 shell to finish initialization, then runs
@@ -294,7 +328,32 @@ small server-side shim transcribes via Whisper.
 - ⠋⠙⠹⠸ (cyan, spinning) — uploading + transcribing
 - **ERR** (red, 2 s) — request failed; press START again to retry
 
-### Recommended install — API track
+### HTTP API track (v1.2, self-hosted transcription server)
+
+Instead of the SSH shim, DSSH can POST the START recording directly to
+any HTTP speech-to-text endpoint.  The request body is a 16 kHz PCM16
+mono WAV; the JSON response's `text` field is the transcription.
+Configure it in SETTINGS or config.ini:
+
+```ini
+voice_api_url = https://192.0.2.10:29006/api/stt
+```
+
+- Transcribed text is typed into the terminal with the same typewriter
+  effect — effectively "voice into the input box"
+- Self-signed https certificates are accepted on the 3DS side
+  (`SSLCOPT_DisableVerify`); http works too.  The upload runs on a
+  worker thread so the UI never stalls
+- **L+START AI ask does not use this track** — it still needs the SSH
+  shim (only the shim knows DeepSeek)
+- Takes effect immediately after SETTINGS SAVE; the debug page shows
+  `VOICE: HTTP API / SSH shim`
+- Bake a LAN endpoint in as the compiled default (kept out of the
+  repo): `make DSSH_VOICE_API_DEFAULT=https://server:29006/api/stt`
+- Reference server: mimo-voice-hub's `/api/stt` (Xiaomi MiMo ASR), with
+  a browser quick page at `/stt` that drives the same endpoint
+
+### Recommended install — API track (SSH shim)
 
 The voice features need **two API keys** on the server.  Both
 together cost a few cents per month for personal use:
@@ -560,6 +619,13 @@ The bottom screen is the soft keyboard — two pages:
 Any key supports hold-style modifier combos.  Example:
 **hold Y + tap b** = `Ctrl-B` (the tmux prefix).
 
+**SET button** (bottom-right, v1.2): opens/closes the on-device
+settings page — server list `< SRV n/4 >` (browsing to a configured
+slot activates it), HOST/PORT/USER/PASSWORD/KEY PATH rows (tap to
+edit; **A** commit, **B** backspace, **SELECT** cancel; AUTH row taps
+toggle key/password), VOICE API field, **SAVE** writes the config back
+to the SD card, **RECONNECT** drops the session and re-dials.
+
 ### Status bar (top 30 px)
 
 ```
@@ -698,8 +764,10 @@ python3 tools/gen_font.py
 bash tools/fetch_pinyin_dict.sh
 python3 tools/gen_pinyin_dict.py
 
-# 8. Build the .3dsx
-make
+# 8. Build the .3dsx (optional: bake a LAN STT endpoint in as the
+#    default voice backend — injected at compile time, not stored in
+#    the repo)
+make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
 
 # 9. (Optional) build the .cia
 bash tools/install_cia_tools.sh   # installs bannertool + makerom into ~/bin
@@ -740,8 +808,9 @@ DSSH/
 │   ├── terminal.{c,h}         # ANSI/VT100 parser (forked from skmtrd)
 │   ├── renderer.{c,h}         # citro2d rendering (terminal, text, CJK)
 │   ├── keyboard.{c,h}         # Physical buttons + IME routing
-│   ├── softkb.{c,h}           # Soft keyboard + candidate strip + debug page
+│   ├── softkb.{c,h}           # Soft keyboard + candidate strip + settings page + debug page
 │   ├── ime_pinyin.{c,h}       # Pinyin engine
+│   ├── voice_api.{c,h}        # HTTP voice-API transport (WAV framing + httpc)
 │   ├── mascot.{c,h}           # Crab mascot
 │   ├── font_atlas.{c,h}       # Codepoint → glyph index
 │   └── font_data.c            # Font bitmaps (gen_font.py output)

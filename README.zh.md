@@ -57,6 +57,13 @@
   markdown 渲染（标题黄色、行内代码青色、列表 • 前缀等），顶屏
   SSH 会话完全不受打扰。modal 里按 **A** 关窗保留 history（可追问），
   按 **B** 关窗清空 history（新对话）。
+- **机内多服务器设置页（v1.2 新增）**：键盘右下角 **SET** 按钮打开
+  设置页——最多 4 台服务器、HOST/PORT/USER 直改、**密码登录**或
+  RSA 公钥二选一、语音 API 直填；SAVE 写回 SD 卡、RECONNECT 一键
+  换服务器重连。**不再需要手工准备 config.ini**。
+- **HTTP 语音 API（v1.2 新增）**：START 的录音可改为直接 POST 给
+  局域网转文字服务器（如 mimo-voice-hub 的 `/api/stt`），返回文字
+  打进终端；`L+START` AI 问答仍走 SSH shim。
 - **RSA-4096 公钥认证**：libssh2 + mbedTLS，私钥放 SD 卡读
 - **原生 Tailscale 传输**：可选地让 3DS 加入 tailnet，通过直连 UDP、
   Tailscale Peer Relay 或 DERP 承载 SSH，不运行 Go 或 `tailscaled`
@@ -159,15 +166,34 @@ ssh-keygen -p -m PEM -f ~/.ssh/id_rsa_3ds
 
 ## 配置 config.ini
 
-把仓库里的 `sd_template/3ds/3dssh/config.ini.example` 拷到 SD 卡的
-`/3ds/3dssh/config.ini`，按你的服务器改：
+**v1.2 起可以直接在 3DS 上配置**：键盘右下角 **SET** 按钮打开设置页
+（最多 4 台服务器，`< SRV n/4 >` 切换，浏览即激活已有服务器；点某行
+进编辑，**A** 确认 / **B** 退格 / **SELECT** 取消），改完点 **SAVE**
+写回 SD 卡，点 **RECONNECT** 立即用当前配置重连。
+
+手工配置仍然支持——把仓库里的 `sd_template/3ds/3dssh/config.ini.example`
+拷到 SD 卡的 `/3ds/3dssh/config.ini`，按你的服务器改：
 
 ```ini
-host       = your-server.example.com
-port       = 22
-user       = ubuntu
-key_path   = sdmc:/3ds/3dssh/id_rsa
-passphrase =
+# 服务器 1..4；下面 server1 用 RSA 公钥，server2 用密码
+server1_host = your-server.example.com
+server1_port = 22
+server1_user = ubuntu
+server1_auth = key
+server1_key_path = sdmc:/3ds/3dssh/id_rsa
+server1_passphrase =
+
+server2_host = 192.0.2.10
+server2_port = 22
+server2_user = root
+server2_auth = password
+server2_password = change-me
+
+# 开机连哪台（1-based）；SETTINGS 里浏览到某台也等于选中它
+active_server = 1
+
+# 可选：HTTP 语音转文字 API，见「语音输入 · HTTP API 轨」
+voice_api_url =
 
 # 可选：自动解锁当前 SSH 用户的 macOS 登录 keychain
 macos_keychain_password =
@@ -181,16 +207,20 @@ tailscale_control_url = https://controlplane.tailscale.com
 
 | 字段 | 说明 |
 |------|------|
-| `host` | 服务器 IP 或域名 |
-| `port` | 端口（默认 22） |
-| `user` | 服务器登录用户名 |
-| `key_path` | 私钥路径，`sdmc:/...` 是 3DS 标准 SD 路径前缀 |
-| `passphrase` | 私钥口令；建议留空（SD 卡上输 passphrase 体验差） |
+| `serverN_host` / `serverN_port` / `serverN_user` | 第 N 台服务器的地址、端口（默认 22）、用户名 |
+| `serverN_auth` | `key`（默认，RSA 公钥）或 `password`（密码登录） |
+| `serverN_key_path` / `serverN_passphrase` | RSA 私钥路径与口令；`sdmc:/...` 是 3DS 标准 SD 路径前缀 |
+| `serverN_password` | password 认证的登录密码（明文存 SD 卡，注意物理安全） |
+| `active_server` | 开机连接的服务器编号（1-based） |
+| `voice_api_url` | HTTP 语音转文字端点；留空走经典 SSH shim 轨 |
 | `macos_keychain_password` | 可选的 macOS 登录密码；填写后为当前 SSH 用户启用自动解锁 |
 | `tailscale_auth_key` | 注册使用的 auth key；填写后自动开启 Tailscale |
 | `tailscale_hostname` | tailnet 中显示的 3DS 设备名 |
 | `tailscale_state` | 持久化机器、WireGuard 与 DISCO 身份的文件 |
 | `tailscale_control_url` | 控制服务器，默认使用 Tailscale SaaS |
+
+> 旧的平铺写法（`host =` / `port =` / `user =` / `key_path =` /
+> `passphrase =`）仍然兼容，等价于只配了 server1。
 
 填写 `macos_keychain_password` 后，DSSH 会等待当前交互式 PTY shell 初始化完成，
 然后执行
@@ -267,7 +297,30 @@ session 的第二个 channel** 上传（零新端口、零新认证、零防火�
 - ⠋⠙⠹⠸（青色旋转）— 上传 + 转写中
 - **ERR**（红色 2 秒）— 失败，再按 START 重试
 
-### 推荐安装 — API 轨
+### HTTP API 轨（v1.2 新增，自建转文字服务器）
+
+不想在服务器上装 shim？DSSH 还可以把 START 的录音以 WAV 直接 POST
+给任意 HTTP 转文字端点。请求体是 16 kHz PCM16 mono WAV，响应 JSON
+里的 `text` 字段就是转写结果。设置页或 config.ini 里配置：
+
+```ini
+voice_api_url = https://192.0.2.10:29006/api/stt
+```
+
+- 转出文字直接打进终端（与 shim 轨相同的打字机效果），编辑框场景
+  下效果等同于"语音输入到输入框"
+- 3DS 侧对 https 自签证书已放行（`SSLCOPT_DisableVerify`），http /
+  https 皆可；上传在后台线程进行，UI 不卡
+- **`L+START` 的 AI 问答不走这条轨**，仍然用 SSH shim（shim 才认识
+  DeepSeek）
+- 设置页 SAVE 后立即生效；debug 页显示当前 `VOICE: HTTP API / SSH shim`
+- 编译期可把局域网端点烘焙成默认值（不进仓库）：
+  `make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt`
+- 本机参考服务端：`~/web-projects/mimo-voice-hub` 的 `/api/stt`
+  （小米 MiMo ASR；浏览器配套快速页 `/stt`，麦克风说话直接出文字）
+  ——拒绝认证等错误会以 `ERR` 提示，响应体也会留在 debug 页 hex 里
+
+### 推荐安装 — API 轨（SSH shim）
 
 语音功能在服务器端需要**两把 API key**。两把加起来日常使用月成本几美分：
 
@@ -511,6 +564,12 @@ dssh-whisper switch         # 不带参数即 toggle
 任何键支持 hold-style 修饰组合，例如：**按住 Y + 点 b** = `Ctrl-B`
 （tmux prefix）。
 
+**SET 按钮**（右下角，v1.2 新增）：打开/关闭机内设置页——服务器列表
+`< SRV n/4 >` 切换（浏览到已有服务器即选中它）、HOST/PORT/USER/
+PASSWORD/KEY PATH 点行进编辑（**A** 确认、**B** 退格、**SELECT**
+取消、AUTH 行点击即切换 key/password）、VOICE API 直填，**SAVE**
+写回 SD 卡，**RECONNECT** 断开并立即重连。
+
 ### 状态条（顶部 30 px）
 
 ```
@@ -637,8 +696,9 @@ python3 tools/gen_font.py
 bash tools/fetch_pinyin_dict.sh
 python3 tools/gen_pinyin_dict.py
 
-# 8. 编译 .3dsx
-make
+# 8. 编译 .3dsx（可选：把局域网 STT 端点烘焙成默认语音后端；
+#    LAN 地址只在编译期注入，不进仓库）
+make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
 
 # 9. （可选）打 .cia
 bash tools/install_cia_tools.sh   # 装 bannertool + makerom 到 ~/bin
@@ -677,8 +737,9 @@ DSSH/
 │   ├── terminal.{c,h}         # ANSI/VT100 解析器（fork skmtrd）
 │   ├── renderer.{c,h}         # citro2d 渲染（终端、文本、CJK）
 │   ├── keyboard.{c,h}         # 物理按键 + IME 路由
-│   ├── softkb.{c,h}           # 软键盘 + 候选条 + debug 页面
+│   ├── softkb.{c,h}           # 软键盘 + 候选条 + 设置页 + debug 页面
 │   ├── ime_pinyin.{c,h}       # 拼音引擎
+│   ├── voice_api.{c,h}        # HTTP 语音 API 传输（WAV 封装 + httpc）
 │   ├── mascot.{c,h}           # 螃蟹吉祥物
 │   ├── font_atlas.{c,h}       # 字体索引
 │   └── font_data.c            # 字体位图（gen_font.py 生成）
@@ -688,6 +749,9 @@ DSSH/
 │   ├── fetch_pinyin_dict.sh   # 下载 rime-ice
 │   ├── gen_pinyin_dict.py     # 词典 → 二进制
 │   ├── test_ime.{c,sh}        # host 端 IME 测试
+│   ├── test_config.{c,sh}     # host 端 config 解析/写回测试
+│   ├── test_terminal.{c,sh}   # host 端终端协议测试
+│   ├── test_voice_api.{c,sh}  # host 端 WAV 封装测试
 │   ├── gen_cia_assets.py      # 图标/banner 派生
 │   └── install_cia_tools.sh   # bannertool + makerom 安装
 ├── romfs/                     # gitignored — 装载 pinyin_dict.bin
