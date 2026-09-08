@@ -560,19 +560,27 @@ static void send_to_ssh(ssh_client_t *ssh, terminal_t *term,
  * On success: returns a new ssh_client_t, resets the local terminal
  * (fish CPR needs remote coordinates), sizes the PTY and sets a status
  * string.  On failure: returns NULL, writes the red SSH-error banner +
- * the diagnostic in err. */
+ * the diagnostic in err.  Dispatches on the active server's auth mode:
+ * "password" servers use ssh_connect_password, everything else publickey. */
 static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
                                    ts3ds *tailscale,
                                    terminal_t *term,
                                    char *status_buf, int status_sz,
                                    char *err, int err_sz) {
-    ssh_client_t *ssh = ssh_connect_pubkey(
-        cfg->host, cfg->port, cfg->user,
-        cfg->key_path, NULL,
-        cfg->passphrase[0] ? cfg->passphrase : NULL,
-        R_TOP_COLS, R_TOP_ROWS,
-        tailscale,
-        err, err_sz);
+    const ssh_server_t *srv = config_active_const(cfg);
+    ssh_client_t *ssh;
+    if (srv->auth == SSH_AUTH_PASSWORD) {
+        ssh = ssh_connect_password(srv->host, srv->port, srv->user,
+                                   srv->password,
+                                   R_TOP_COLS, R_TOP_ROWS,
+                                   tailscale, err, err_sz);
+    } else {
+        ssh = ssh_connect_pubkey(srv->host, srv->port, srv->user,
+                                 srv->key_path, NULL,
+                                 srv->passphrase[0] ? srv->passphrase : NULL,
+                                 R_TOP_COLS, R_TOP_ROWS,
+                                 tailscale, err, err_sz);
+    }
 
     if (!ssh) {
         char line[256];
@@ -588,7 +596,68 @@ static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
     terminal_reset(term);
     ssh_set_pty_size(ssh, R_TOP_COLS, R_TOP_ROWS);
     snprintf(status_buf, status_sz, "connected %.56s:%d",
-             cfg->host, cfg->port);
+             srv->host, srv->port);
+    return ssh;
+}
+
+/* Shared by the SELECT-key reconnect and the SETTINGS-page RECONNECT
+ * button.  The caller must have torn down any old session first (voice
+ * abort + ssh_disconnect + ssh = NULL).  Renders a "Reconnecting..."
+ * frame (so the banner is visible during the blocking handshake), dials
+ * with the current config and re-runs the keychain bootstrap.  Returns
+ * the new session or NULL; on success the caller clears ssh_dead and
+ * celebrates. */
+static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg,
+                                       ts3ds *tailscale,
+                                       terminal_t *term,
+                                       renderer_t *r,
+                                       softkb_t *kb,
+                                       keyboard_t *kbd,
+                                       mascot_t *mc,
+                                       C3D_RenderTarget *top,
+                                       C3D_RenderTarget *bot,
+                                       char *status_buf, int status_sz,
+                                       uint32_t *status_color,
+                                       char *err, int err_sz) {
+    terminal_write(term, "\x1b[33mReconnecting...\x1b[0m\r\n");
+    /* Put the crab into its "looking up / waiting" pose before we flush
+     * the frame below, so the user sees it react. */
+    mascot_set_reconnecting(mc, 1);
+    /* The blocking handshake below stalls the loop — flush one frame
+     * right now so the banner is actually on screen during the wait. */
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
+    C2D_SceneBegin(top);
+    renderer_draw_terminal(r, term);
+    C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
+    C2D_SceneBegin(bot);
+    softkb_draw(kb, r, kbd);
+    /* Bottom row: clock + mascot, mirroring the main render path so the
+     * reconnect frame isn't missing anything. */
+    if (!softkb_in_debug(kb)) {
+        char clock_buf[24];
+        time_t now = time(NULL);
+        struct tm lt;
+        localtime_r(&now, &lt);
+        snprintf(clock_buf, sizeof(clock_buf),
+                 "%02d-%02d %02d:%02d",
+                 lt.tm_mon + 1, lt.tm_mday,
+                 lt.tm_hour, lt.tm_min);
+        renderer_draw_text_px(2, 221, clock_buf, COLOR_DIM);
+        if (softkb_mascot_enabled(kb)) mascot_draw(mc);
+    }
+    C3D_FrameEnd(0);
+
+    ssh_client_t *ssh = reconnect_ssh(cfg, tailscale, term,
+                                      status_buf, status_sz,
+                                      err, err_sz);
+    /* Reconnected to a macOS host: its login keychain locked again with
+     * the old session — unlock it again so Claude Code keeps finding
+     * its credentials. */
+    ssh = keychain_bootstrap(ssh, cfg, term, r, kb, kbd, top, bot,
+                             status_buf, status_sz, status_color,
+                             err, err_sz);
+    mascot_set_reconnecting(mc, 0);
     return ssh;
 }
 
@@ -617,9 +686,7 @@ int main(int argc, char *argv[]) {
     ssh_config_t cfg;
     int loaded = config_load(&cfg, CONFIG_PATH);
     snprintf(status_buf, sizeof(status_buf),
-             loaded ? "config: SD" : "config: defaults");
-
-    /* Seed RNG so the mascot's idle/walk transitions don't repeat across
+             loaded ? "config: SD" : "config: defaults");    /* Seed RNG so the mascot's idle/walk transitions don't repeat across
      * runs.  time(NULL) is fine — we don't need cryptographic randomness. */
     srand((unsigned)time(NULL));
 
@@ -628,10 +695,11 @@ int main(int argc, char *argv[]) {
     renderer_t *r    = renderer_init(top, bot);
     keyboard_t *kbd  = keyboard_init();
     /* Mascot lives in the bottom row (y=214..239, 26 px tall).  Clock
-     * occupies x=2..67 on the left; mascot scampers in x=72..302 on
-     * the right.  Crab is 11 px tall (10-row body + 1-row feet) so
-     * y_top = 214 + (26-11)/2 = 221 centers it in the row. */
-    mascot_t   *mc   = mascot_init(72, 302, 221);
+     * occupies x=2..67 on the left; mascot scampers in x=72..278 on
+     * the right — the pinned SET button owns x=284..318.  Crab is
+     * 11 px tall (10-row body + 1-row feet) so y_top = 214 + (26-11)/2
+     * = 221 centers it in the row. */
+    mascot_t   *mc   = mascot_init(72, 278, 221);
     /* IME loads later (after the M7 banner pumps); softkb tolerates
      * a NULL ime by falling back to passthrough in CN mode. */
     ime_t      *ime  = NULL;
@@ -642,6 +710,10 @@ int main(int argc, char *argv[]) {
      * mic only opens during the RECORDING state. */
     voice_t    *voice = voice_init();
     if (kb && voice) softkb_set_voice(kb, voice);
+    /* SETTINGS page edits cfg in place; SAVE persists it to the SD card
+     * and refreshes the voice API endpoint. */
+    if (kb) softkb_set_config(kb, &cfg);
+    voice_set_api(voice, cfg.voice_api_url);
     /* M12: AI-ask modal — pops over the soft keyboard when the user
      * presses L+START and a Q&A returns from DeepSeek. */
     ai_modal_t *aim   = ai_modal_init();
@@ -758,10 +830,12 @@ int main(int argc, char *argv[]) {
     }
 
     {
-        char banner[160];
+        const ssh_server_t *srv = config_active_const(&cfg);
+        char banner[224];
         snprintf(banner, sizeof(banner),
-                 "connecting to \x1b[33m%.48s@%.64s:%d\x1b[0m...\r\n",
-                 cfg.user, cfg.host, cfg.port);
+                 "connecting to \x1b[33m%.48s@%.64s:%d\x1b[0m (%s auth)...\r\n",
+                 srv->user, srv->host, srv->port,
+                 srv->auth == SSH_AUTH_PASSWORD ? "password" : "publickey");
         terminal_write(term, banner);
     }
 
@@ -780,14 +854,14 @@ int main(int argc, char *argv[]) {
                              status_buf, sizeof(status_buf), &status_color,
                              err, sizeof(err));
 
-    /* NOTE: cfg.passphrase / cfg.macos_keychain_password intentionally stay
-     * in memory — the SELECT-key reconnect path re-authenticates with them.
-     * Both are wiped by clear_secret() in the cleanup path at exit. */
+    /* NOTE: the per-server passwords/passphrases and the global
+     * macos_keychain_password intentionally stay in memory — the
+     * SELECT-key reconnect path re-authenticates with them.  All of them
+     * are wiped by clear_secret() in the cleanup path at exit. */
 
 idle_loop:
     {
         char rbuf[READ_BUFSZ];
-        (void)status_buf; (void)status_color;  /* not currently rendered */
 
         /* ALERT triggers (mascot raises the red ✕):
          *
@@ -823,6 +897,18 @@ idle_loop:
              * anywhere on the bottom screen=clear. */
             int modal_open = ai_modal_visible(aim);
 
+            /* SETTINGS edit mode owns A / B / SELECT before anything
+             * else: A commits the field buffer, B backspaces one glyph,
+             * SELECT cancels.  Tapped keyboard bytes are redirected in
+             * the touch section below. */
+            int set_open = softkb_in_settings(kb);
+            int set_edit = softkb_settings_editing(kb);
+            if (set_edit) {
+                if (down & KEY_A)      softkb_settings_commit(kb);
+                if (down & KEY_B)      softkb_settings_backspace(kb);
+                if (down & KEY_SELECT) softkb_settings_cancel(kb);
+            }
+
             if (modal_open) {
                 if (down & KEY_A) {
                     voice_ai_close_keep(voice);
@@ -832,9 +918,12 @@ idle_loop:
                     voice_ai_close_clear(voice);
                     ai_modal_close(aim);
                 }
-            } else {
+            } else if (!set_open) {
                 /* L + START → AI ask mode.  Plain START → voice-IME mode.
-                 * 3DS HOME exits any homebrew, so START is fully ours. */
+                 * 3DS HOME exits any homebrew, so START is fully ours.
+                 * Suppressed while the SETTINGS page is open — voice types
+                 * into the SSH shell, which is not what a user editing
+                 * server fields expects. */
                 if (down & KEY_START) {
                     if (held & KEY_L) voice_ai_toggle(voice, ssh);
                     else              voice_toggle(voice, ssh);
@@ -951,53 +1040,12 @@ idle_loop:
              * would slip through to keyboard_handle_input as a stray Esc
              * into the freshly opened session. */
             int select_consumed = 0;
-            if (ssh_dead && !modal_open && (down & KEY_SELECT)) {
+            if (ssh_dead && !modal_open && !set_edit && (down & KEY_SELECT)) {
                 select_consumed = 1;
-                terminal_write(term,
-                    "\x1b[33mReconnecting...\x1b[0m\r\n");
-                /* Put the crab into its "looking up / waiting" pose before
-                 * we flush the frame below, so the user sees it react. */
-                mascot_set_reconnecting(mc, 1);
-                /* ssh_connect_pubkey below is a blocking handshake that
-                 * takes a few seconds.  The normal per-frame render at
-                 * the bottom of this loop won't run until it returns, so
-                 * the line above would stay hidden in the terminal buffer
-                 * for the whole wait.  Flush one frame right now so the
-                 * user actually sees "Reconnecting..." while the handshake
-                 * is in flight, rather than a frozen blank screen. */
-                C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-                C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
-                C2D_SceneBegin(top);
-                renderer_draw_terminal(r, term);
-                C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
-                C2D_SceneBegin(bot);
-                softkb_draw(kb, r, kbd);
-                /* Bottom row: clock + mascot, mirroring the main render
-                 * path so the reconnect frame isn't missing anything. */
-                if (!softkb_in_debug(kb)) {
-                    char clock_buf[24];
-                    time_t now = time(NULL);
-                    struct tm lt;
-                    localtime_r(&now, &lt);
-                    snprintf(clock_buf, sizeof(clock_buf),
-                             "%02d-%02d %02d:%02d",
-                             lt.tm_mon + 1, lt.tm_mday,
-                             lt.tm_hour, lt.tm_min);
-                    renderer_draw_text_px(2, 221, clock_buf, COLOR_DIM);
-                    if (softkb_mascot_enabled(kb)) mascot_draw(mc);
-                }
-                C3D_FrameEnd(0);
-                ssh = reconnect_ssh(&cfg, tailscale, term,
-                                    status_buf, sizeof(status_buf),
-                                    err, sizeof(err));
-                /* Reconnected to a macOS host: its login keychain locked
-                 * again with the old session — unlock it again so Claude
-                 * Code keeps finding its credentials. */
-                ssh = keychain_bootstrap(ssh, &cfg, term, r, kb, kbd,
-                                         top, bot,
-                                         status_buf, sizeof(status_buf),
-                                         &status_color, err, sizeof(err));
-                mascot_set_reconnecting(mc, 0);
+                ssh = attempt_reconnect(&cfg, tailscale, term, r, kb, kbd,
+                                        mc, top, bot,
+                                        status_buf, sizeof(status_buf),
+                                        &status_color, err, sizeof(err));
                 if (ssh) {
                     ssh_dead    = 0;
                     stall_alert = 0;
@@ -1019,7 +1067,7 @@ idle_loop:
              * the handler still ticks held-state timers (keeping
              * modifier release detection coherent for the post-modal
              * world) but registers no edge events. */
-            u32 input_down = modal_open ? 0u : down;
+            u32 input_down = (modal_open || set_open) ? 0u : down;
             /* Mask SELECT when the session is dead or was just consumed by
              * the reconnect above, so it isn't emitted as Esc. */
             if (ssh_dead || select_consumed) input_down &= ~KEY_SELECT;
@@ -1054,7 +1102,10 @@ idle_loop:
                     voice_ai_close_clear(voice);
                     ai_modal_close(aim);
                 }
-            } else if (touch_down && ty >= 214 && show_mascot) {
+            } else if (touch_down && ty >= 214 && show_mascot &&
+                       !softkb_settings_button_hit(kb, tx, ty)) {
+                /* The pinned SET button sits in the mascot's row —
+                 * route its taps to softkb, the rest go to the crab. */
                 if (mascot_hit_test(mc, tx, ty))
                     mascot_on_touched(mc, tx);
             } else {
@@ -1063,7 +1114,59 @@ idle_loop:
                  * down-edge internally from prev_pressed.  On no-touch
                  * frames this also runs the release-fade path. */
                 const char *kt = softkb_touch(kb, kbd, tx, ty, touch_pressed);
-                if (kt) send_to_ssh(ssh, term, kt, (int)strlen(kt), mc);
+                if (kt) {
+                    if (set_edit) {
+                        /* Field edit in progress: tapped characters go
+                         * into the settings buffer, not the SSH shell. */
+                        softkb_settings_feed(kb, kt);
+                    } else {
+                        send_to_ssh(ssh, term, kt, (int)strlen(kt), mc);
+                    }
+                }
+            }
+
+            /* ── SETTINGS actions ──
+             * SAVE persists the edited config to the SD card and
+             * refreshes the voice API endpoint; RECONNECT tears down the
+             * live session and immediately re-dials with the current
+             * config (same path as the SELECT reconnect). */
+            softkb_action_t act;
+            while ((act = softkb_settings_consume_action(kb)) !=
+                   SOFTKB_ACT_NONE) {
+                if (act == SOFTKB_ACT_SAVE) {
+                    if (config_save(&cfg, CONFIG_PATH) == 0) {
+                        voice_set_api(voice, cfg.voice_api_url);
+                        terminal_write(term,
+                            "\x1b[32msettings saved to SD\x1b[0m\r\n");
+                    } else {
+                        terminal_write(term,
+                            "\x1b[31mconfig save FAILED (SD writable?)\x1b[0m"
+                            "\r\n");
+                    }
+                } else if (act == SOFTKB_ACT_RECONNECT) {
+                    voice_abort(voice);
+                    if (ssh) {
+                        ssh_disconnect(ssh);
+                        ssh = NULL;
+                    }
+                    ssh_dead = 1;
+                    ssh = attempt_reconnect(&cfg, tailscale, term, r, kb,
+                                            kbd, mc, top, bot,
+                                            status_buf, sizeof(status_buf),
+                                            &status_color, err, sizeof(err));
+                    if (ssh) {
+                        ssh_dead    = 0;
+                        stall_alert = 0;
+                        mascot_celebrate(mc);
+                        last_rx_at   = time(NULL);
+                        g_last_tx_at = last_rx_at;
+                    } else {
+                        mascot_sadden(mc);
+                        terminal_write(term,
+                            "\x1b[31mReconnect failed; press SELECT to "
+                            "retry.\x1b[0m\r\n");
+                    }
+                }
             }
 
             /* Mascot ticks only when it's actually being shown.  When
@@ -1126,7 +1229,13 @@ cleanup:
         tailscale = NULL;
         tailscale_debug_flush(&tailscale_debug, term);
     }
-    clear_secret(cfg.passphrase, sizeof(cfg.passphrase));
+    /* Multi-server: wipe every slot's credentials. */
+    for (int i = 0; i < cfg.server_count; i++) {
+        clear_secret(cfg.servers[i].password,
+                     sizeof(cfg.servers[i].password));
+        clear_secret(cfg.servers[i].passphrase,
+                     sizeof(cfg.servers[i].passphrase));
+    }
     clear_secret(cfg.macos_keychain_password,
                  sizeof(cfg.macos_keychain_password));
     clear_secret(cfg.tailscale_auth_key,

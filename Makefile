@@ -48,6 +48,12 @@ CFLAGS	+=	-DDSSH_TAILSCALE_PATH=\"$(DSSH_TAILSCALE_PATH)\"
 DSSH_TAILSCALE_VERBOSE ?= 0
 CFLAGS	+=	-DDSSH_TAILSCALE_VERBOSE=$(DSSH_TAILSCALE_VERBOSE)
 
+# Default HTTP voice-transcription endpoint (mimo-voice-hub /api/stt or
+# any compatible STT server).  Injected at build time so LAN addresses
+# never land in the repo; config.ini / SETTINGS can override per device.
+DSSH_VOICE_API_DEFAULT ?= ""
+CFLAGS	+=	-DDSSH_VOICE_API_DEFAULT=\"$(DSSH_VOICE_API_DEFAULT)\"
+
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
 ASFLAGS	:=	-g $(ARCH)
@@ -120,7 +126,7 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: $(BUILD) clean all ime-dict test-ime test-config test-terminal cia cia-tools cia-clean
+.PHONY: $(BUILD) clean all ime-dict test-ime test-config test-terminal test-voice-api cia cia-tools cia-clean
 
 all: $(BUILD)
 
@@ -141,6 +147,10 @@ test-config:
 # Host-side terminal protocol tests (scrolling + fish cursor queries).
 test-terminal:
 	@bash tools/test_terminal.sh
+
+# Host-side WAV-framing tests for the HTTP voice-API transport.
+test-voice-api:
+	@bash tools/test_voice_api.sh
 
 # ── M9: CIA packaging ───────────────────────────────────────────────
 #

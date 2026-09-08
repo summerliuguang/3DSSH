@@ -3,6 +3,7 @@
 #include "keyboard.h"
 #include "ime_pinyin.h"
 #include "voice.h"
+#include "config.h"
 
 /*
  * On-screen touch keyboard for the 3DS bottom screen (M4 + M7 IME).
@@ -92,3 +93,55 @@ int  softkb_in_debug(const softkb_t *kb);
  * to 1 (mascot visible).  When 0, main.c should skip mascot_update
  * and mascot_draw so the crab stops moving and disappears. */
 int  softkb_mascot_enabled(const softkb_t *kb);
+
+/* ── Settings page ──────────────────────────────────────────────────
+ *
+ * A "SET" button pinned to the bottom-right corner of the bottom row
+ * toggles a full-screen settings overlay (like the debug page).  It
+ * edits the shared ssh_config_t in place:
+ *
+ *   - server selector < SRV n/N > also selects the ACTIVE server
+ *   - per-server fields: HOST / PORT / USER / AUTH(toggle) /
+ *     PASSWORD / KEY PATH, plus the global VOICE API URL
+ *   - SAVE writes the config back to the SD card (via the action flag;
+ *     main.c does the actual config_save + voice_set_api)
+ *   - RECONNECT closes the live session so SELECT re-dials with the
+ *     newly edited server
+ *
+ * Tapping a value row enters edit mode: the keyboard pages come back
+ * and taps feed the field buffer.  A commits, B backspaces, SELECT
+ * cancels. */
+
+typedef enum {
+    SOFTKB_ACT_NONE = 0,
+    SOFTKB_ACT_SAVE,
+    SOFTKB_ACT_RECONNECT,
+} softkb_action_t;
+
+/* Hand softkb the config it should edit.  The pointer must outlive the
+ * softkb (main.c keeps cfg on main()'s stack for the whole session). */
+void softkb_set_config(softkb_t *kb, ssh_config_t *cfg);
+
+/* True iff the settings overlay replaces the keyboard right now. */
+int  softkb_in_settings(const softkb_t *kb);
+
+/* True iff a field edit is in progress (keyboard pages visible, taps
+ * feed the edit buffer — main.c must redirect softkb_touch output). */
+int  softkb_settings_editing(const softkb_t *kb);
+
+/* True iff (tx,ty) lands on the pinned bottom-right SET button.  main.c
+ * routes these taps to softkb_touch even though they're in the bottom
+ * (mascot) row. */
+int  softkb_settings_button_hit(const softkb_t *kb, int tx, int ty);
+
+/* Edit-mode key handling (main.c calls these on the key down-edges and
+ * masks them from keyboard_handle_input). */
+void softkb_settings_commit(softkb_t *kb);      /* A */
+void softkb_settings_backspace(softkb_t *kb);   /* B */
+void softkb_settings_cancel(softkb_t *kb);      /* SELECT */
+
+/* Feed tapped keyboard bytes into the field being edited. */
+void softkb_settings_feed(softkb_t *kb, const char *bytes);
+
+/* Pop one pending SAVE / RECONNECT action (main.c executes it). */
+softkb_action_t softkb_settings_consume_action(softkb_t *kb);

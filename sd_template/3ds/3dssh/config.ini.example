@@ -1,48 +1,50 @@
-# DSSH — SSH connection config
-# Copy this to sd:/3ds/3dssh/config.ini and edit values for your server.
+# DSSH — SSH connection config (multi-server format)
+# Copy this to sd:/3ds/3dssh/config.ini and edit for your servers.
+# You can also skip this file entirely: the on-device SETTINGS page
+# (SET button, bottom-right of the keyboard) edits and saves this file.
 
-# SSH server hostname or IP
-host = your-server.example.com
+# ── Servers (1..4; the SETTINGS < SRV n/4 > selector switches them) ──
 
-# SSH port (default 22)
-port = 22
-
-# Username on the server
-user = ubuntu
-
-# Path to your RSA private key on the SD card.
-# Generate this on your PC with (-m PEM is REQUIRED — see note below):
+# server1: classic RSA public-key auth
+server1_host = your-server.example.com
+server1_port = 22
+server1_user = ubuntu
+server1_auth = key
+# Path to your RSA private key on the SD card.  Generate on your PC with
+# (-m PEM is REQUIRED — 3DS mbedtls 2.28 cannot parse OpenSSH format):
 #   ssh-keygen -t rsa -b 4096 -m PEM -f ~/.ssh/id_rsa_3ds -C "3ds-ssh-client"
-# Then ssh-copy-id the public key to the server, and copy the private key here.
-#
-# IMPORTANT: 3DS mbedtls 2.28 only parses traditional PEM keys
-# (-----BEGIN RSA PRIVATE KEY-----).  Without -m PEM, modern ssh-keygen
-# emits OpenSSH format (-----BEGIN OPENSSH PRIVATE KEY-----) and the 3DS
-# will fail with "auth failed" at handshake.  Convert an existing key
-# in place with:  ssh-keygen -p -m PEM -f ~/.ssh/id_rsa_3ds
-key_path = sdmc:/3ds/3dssh/id_rsa
+server1_key_path = sdmc:/3ds/3dssh/id_rsa
+server1_passphrase =
 
-# Passphrase for the key, or leave empty for an unencrypted key.
-# (Recommended: unencrypted, since the SD card is the only place the key lives.)
-passphrase =
+# server2: password auth example (delete if unused)
+#server2_host = 192.0.2.10
+#server2_port = 22
+#server2_user = root
+#server2_auth = password
+#server2_password = change-me
 
-# Optional: automatically unlock the current SSH user's macOS login keychain.
-# Leave empty to disable it.
-# The password is sent only after the interactive PTY shows its unlock prompt;
-# it is never placed in a command-line argument or shell history.
-# Quote it if it contains # or leading/trailing spaces, for example:
-#   macos_keychain_password = "my # password"
-#
-# SECURITY WARNING: this stores your macOS login password in plaintext on the
-# removable SD card. Prefer a dedicated macOS account and keep the SD card safe.
+# Which server to connect to at boot (1-based).
+active_server = 1
+
+# ── Voice input ──
+# HTTP voice-transcription API (mimo-voice-hub /api/stt or any endpoint
+# accepting a WAV POST and answering {"text": "..."}).  When set, START
+# recordings upload here instead of the SSH shim.  Leave empty to use
+# the classic dssh-whisper-shim over the SSH session.  The on-device
+# default can also be baked in at build time:
+#   make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
+voice_api_url =
+
+# ── Global (legacy) options ──
+# Optional: automatically unlock the current SSH user's macOS login
+# keychain.  Quote if it contains # or edge spaces.
+# SECURITY WARNING: stored in plaintext on the removable SD card.
 macos_keychain_password =
 
-# Optional native Tailscale transport. Setting an auth key enables Tailscale.
-# Later launches also start automatically when tailscale.state exists, so the
-# key may remain configured but removing it reduces exposure on the SD card.
+# Optional native Tailscale transport. Setting an auth key enables
+# Tailscale; later launches also start automatically when the state file
+# exists.
 tailscale_auth_key =
-
-# Optional values below use these defaults when omitted or left empty.
 tailscale_hostname = dssh-3ds
 tailscale_state = sdmc:/3ds/3dssh/tailscale.state
 tailscale_control_url = https://controlplane.tailscale.com

@@ -136,25 +136,28 @@ static void close_pending_transport(int sock, ts3ds_conn *connection,
     free(transport);
 }
 
-ssh_client_t *ssh_connect_pubkey(const char *host, int port,
-                                 const char *user,
-                                 const char *key_path,
-                                 const char *pubkey_path,
-                                 const char *passphrase,
-                                 int pty_cols, int pty_rows,
-                                 ts3ds *tailscale,
-                                 char *err_buf, int err_sz) {
+/* Dial TCP (or Tailscale) and run the blocking SSH banner/kex handshake.
+ * On failure: cleans up every resource it created, calls libssh2_exit(),
+ * fills err_buf, and returns NULL.  On success the outputs describe the
+ * resources the caller now owns. */
+static LIBSSH2_SESSION *dial_session(const char *host, int port,
+                                     ts3ds *tailscale,
+                                     int *sock_out,
+                                     ts3ds_conn **tsconn_out,
+                                     ssh_transport **transport_out,
+                                     char *err_buf, int err_sz) {
+    *sock_out = -1;
+    *tsconn_out = NULL;
+    *transport_out = NULL;
+
     if (libssh2_init(0) != 0) {
         copy_err(err_buf, err_sz, "libssh2_init failed");
         return NULL;
     }
 
-    int sock = -1;
-    ts3ds_conn *tailscale_conn = NULL;
-    ssh_transport *transport = NULL;
     if (tailscale) {
         int dial_result = ts3ds_dial_tcp(tailscale, host,
-                                         (uint16_t)port, &tailscale_conn);
+                                         (uint16_t)port, tsconn_out);
         if (dial_result != TS3DS_OK) {
             snprintf(err_buf, err_sz,
                      "Tailscale TCP dial failed (%d): %.180s",
@@ -162,32 +165,34 @@ ssh_client_t *ssh_connect_pubkey(const char *host, int port,
             libssh2_exit();
             return NULL;
         }
-        transport = calloc(1, sizeof(*transport));
-        if (!transport) {
-            ts3ds_conn_close(tailscale_conn);
+        *transport_out = calloc(1, sizeof(ssh_transport));
+        if (!*transport_out) {
+            copy_err(err_buf, err_sz, "out of memory");
+            ts3ds_conn_close(*tsconn_out);
+            *tsconn_out = NULL;
             libssh2_exit();
             return NULL;
         }
-        transport->tailscale = tailscale;
-        transport->connection = tailscale_conn;
-        transport->blocking = 1;
+        (*transport_out)->tailscale = tailscale;
+        (*transport_out)->connection = *tsconn_out;
+        (*transport_out)->blocking = 1;
     } else {
-        sock = tcp_connect(host, port, err_buf, err_sz);
-        if (sock < 0) {
+        *sock_out = tcp_connect(host, port, err_buf, err_sz);
+        if (*sock_out < 0) {
             libssh2_exit();
             return NULL;
         }
     }
 
     LIBSSH2_SESSION *session = libssh2_session_init_ex(NULL, NULL, NULL,
-                                                       transport);
+                                                       *transport_out);
     if (!session) {
         copy_err(err_buf, err_sz, "session_init failed");
-        close_pending_transport(sock, tailscale_conn, transport);
+        close_pending_transport(*sock_out, *tsconn_out, *transport_out);
         libssh2_exit();
         return NULL;
     }
-    if (transport) {
+    if (*transport_out) {
         libssh2_session_callback_set(session, LIBSSH2_CALLBACK_SEND,
                                      (void *)tailscale_send_cb);
         libssh2_session_callback_set(session, LIBSSH2_CALLBACK_RECV,
@@ -195,118 +200,25 @@ ssh_client_t *ssh_connect_pubkey(const char *host, int port,
     }
     libssh2_session_set_blocking(session, 1);
 
-    int hs_rc = libssh2_session_handshake(session, transport ? 0 : sock);
+    int hs_rc = libssh2_session_handshake(session, *transport_out ? 0 : *sock_out);
     if (hs_rc != 0) {
         copy_libssh2_err(err_buf, err_sz, session, "handshake", hs_rc);
         libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
+        close_pending_transport(*sock_out, *tsconn_out, *transport_out);
         libssh2_exit();
         return NULL;
     }
+    return session;
+}
 
-    /* Pre-check 1: can we open the key file at all? Capture size + header. */
-    long key_size = 0;
-    {
-        FILE *kf = fopen(key_path, "rb");
-        if (!kf) {
-            snprintf(err_buf, err_sz,
-                     "open key file failed: %s (errno=%d)", key_path, errno);
-            libssh2_session_disconnect(session, "no key");
-            libssh2_session_free(session);
-            close_pending_transport(sock, tailscale_conn, transport);
-            libssh2_exit();
-            return NULL;
-        }
-        fseek(kf, 0, SEEK_END);
-        key_size = ftell(kf);
-        fseek(kf, 0, SEEK_SET);
-        char first[40] = {0};
-        size_t n = fread(first, 1, sizeof(first) - 1, kf);
-        fclose(kf);
-        first[n] = 0;
-        if (!strstr(first, "BEGIN") ||
-            (!strstr(first, "RSA PRIVATE KEY") &&
-             !strstr(first, "PRIVATE KEY"))) {
-            snprintf(err_buf, err_sz,
-                     "key not PEM (size=%ld). Head: %.30s", key_size, first);
-            libssh2_session_disconnect(session, "bad key");
-            libssh2_session_free(session);
-            close_pending_transport(sock, tailscale_conn, transport);
-            libssh2_exit();
-            return NULL;
-        }
-    }
-
-    /* Pre-check 2: ask server which auth methods it accepts for this user.
-     * Always include the methods string in any later auth error for context. */
-    char *methods = libssh2_userauth_list(session, user, (unsigned int)strlen(user));
-    if (methods && !strstr(methods, "publickey")) {
-        snprintf(err_buf, err_sz,
-                 "server rejects publickey for %s. Allowed: %s",
-                 user, methods);
-        libssh2_session_disconnect(session, "no pubkey method");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
-        return NULL;
-    }
-
-    /* Pre-check 3: parse key directly with mbedTLS so we get its specific
-     * error code (libssh2's mbedTLS backend swallows mbedTLS errors and just
-     * returns -1). This is purely diagnostic — we then let libssh2 do its
-     * own parse during userauth_publickey_fromfile_ex. */
-    {
-        mbedtls_pk_context tctx;
-        mbedtls_pk_init(&tctx);
-        int mb_rc = mbedtls_pk_parse_keyfile(
-            &tctx, key_path,
-            (passphrase && *passphrase) ? passphrase : NULL);
-        if (mb_rc != 0) {
-            char mb_msg[80] = {0};
-            mbedtls_strerror(mb_rc, mb_msg, sizeof(mb_msg));
-            snprintf(err_buf, err_sz,
-                     "mbedTLS parse: rc=-0x%04X %s | path=%s",
-                     (unsigned)-mb_rc, mb_msg, key_path);
-            mbedtls_pk_free(&tctx);
-            libssh2_session_disconnect(session, "mbedtls parse");
-            libssh2_session_free(session);
-            close_pending_transport(sock, tailscale_conn, transport);
-            libssh2_exit();
-            return NULL;
-        }
-        /* Stash success info into err_buf as a side-channel; if any later
-         * step fails, the caller will still see the type/bits we saw. */
-        snprintf(err_buf, err_sz, "(parse OK: %s %u-bit) ",
-                 mbedtls_pk_get_name(&tctx),
-                 (unsigned)mbedtls_pk_get_bitlen(&tctx));
-        mbedtls_pk_free(&tctx);
-    }
-
-    /* RSA pubkey from file. pubkey_path may be NULL — libssh2 derives it. */
-    int auth = libssh2_userauth_publickey_fromfile_ex(
-        session, user, (unsigned int)strlen(user),
-        pubkey_path, key_path,
-        passphrase ? passphrase : "");
-    if (auth != 0) {
-        char inner[160] = {0};
-        copy_libssh2_err(inner, sizeof(inner), session, "auth", auth);
-        /* Note: err_buf currently holds "(parse OK: RSA 4096-bit) " prefix
-         * from the mbedTLS pre-check success path; preserve it so we know
-         * mbedTLS itself parsed the key fine and the issue is downstream. */
-        char prefix[64] = {0};
-        snprintf(prefix, sizeof(prefix), "%.63s", err_buf);
-        snprintf(err_buf, err_sz,
-                 "%s%s | key_size=%ld user=%s methods=[%s]",
-                 prefix, inner, key_size, user, methods ? methods : "?");
-        libssh2_session_disconnect(session, "auth failed");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
-        return NULL;
-    }
-    /* Auth succeeded — clear the diagnostic prefix from err_buf. */
-    err_buf[0] = 0;
-
+/* Post-auth: open the session channel, PTY + shell, flip back to
+ * non-blocking, enable keepalives, allocate the client handle.  On failure
+ * tears down session + transport + libssh2 and returns NULL. */
+static ssh_client_t *finish_shell(LIBSSH2_SESSION *session, int sock,
+                                  ts3ds_conn *tailscale_conn,
+                                  ssh_transport *transport,
+                                  int pty_cols, int pty_rows,
+                                  char *err_buf, int err_sz) {
     LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
     if (!channel) {
         copy_libssh2_err(err_buf, err_sz, session, "channel_open", -1);
@@ -374,6 +286,183 @@ ssh_client_t *ssh_connect_pubkey(const char *host, int port,
     ssh->channel   = channel;
     ssh->connected = 1;
     return ssh;
+}
+
+/* Tear down a session whose post-handshake pre-auth checks failed. */
+static void abort_session(LIBSSH2_SESSION *session, const char *reason,
+                          int sock, ts3ds_conn *tailscale_conn,
+                          ssh_transport *transport) {
+    libssh2_session_disconnect(session, reason);
+    libssh2_session_free(session);
+    close_pending_transport(sock, tailscale_conn, transport);
+    libssh2_exit();
+}
+
+/* Query the auth methods the server allows for this user.  Returns the
+ * libssh2-allocated methods string (do NOT free — libssh2 owns it) or
+ * NULL; the string stays valid until the next libssh2 call, which is all
+ * the connect paths need it for. */
+static const char *query_auth_methods(LIBSSH2_SESSION *session,
+                                      const char *user) {
+    return libssh2_userauth_list(session, user,
+                                 (unsigned int)strlen(user));
+}
+
+ssh_client_t *ssh_connect_pubkey(const char *host, int port,
+                                 const char *user,
+                                 const char *key_path,
+                                 const char *pubkey_path,
+                                 const char *passphrase,
+                                 int pty_cols, int pty_rows,
+                                 ts3ds *tailscale,
+                                 char *err_buf, int err_sz) {
+    int sock;
+    ts3ds_conn *tailscale_conn;
+    ssh_transport *transport;
+
+    LIBSSH2_SESSION *session = dial_session(host, port, tailscale,
+                                            &sock, &tailscale_conn,
+                                            &transport, err_buf, err_sz);
+    if (!session) return NULL;
+
+    /* Pre-check 1: can we open the key file at all? Capture size + header. */
+    long key_size = 0;
+    {
+        FILE *kf = fopen(key_path, "rb");
+        if (!kf) {
+            snprintf(err_buf, err_sz,
+                     "open key file failed: %s (errno=%d)", key_path, errno);
+            abort_session(session, "no key", sock, tailscale_conn, transport);
+            return NULL;
+        }
+        fseek(kf, 0, SEEK_END);
+        key_size = ftell(kf);
+        fseek(kf, 0, SEEK_SET);
+        char first[40] = {0};
+        size_t n = fread(first, 1, sizeof(first) - 1, kf);
+        fclose(kf);
+        first[n] = 0;
+        if (!strstr(first, "BEGIN") ||
+            (!strstr(first, "RSA PRIVATE KEY") &&
+             !strstr(first, "PRIVATE KEY"))) {
+            snprintf(err_buf, err_sz,
+                     "key not PEM (size=%ld). Head: %.30s", key_size, first);
+            abort_session(session, "bad key", sock, tailscale_conn, transport);
+            return NULL;
+        }
+    }
+
+    /* Pre-check 2: ask server which auth methods it accepts for this user.
+     * Always include the methods string in any later auth error for context. */
+    const char *methods = query_auth_methods(session, user);
+    if (methods && !strstr(methods, "publickey")) {
+        snprintf(err_buf, err_sz,
+                 "server rejects publickey for %s. Allowed: %s",
+                 user, methods);
+        abort_session(session, "no pubkey method",
+                      sock, tailscale_conn, transport);
+        return NULL;
+    }
+
+    /* Pre-check 3: parse key directly with mbedTLS so we get its specific
+     * error code (libssh2's mbedTLS backend swallows mbedTLS errors and just
+     * returns -1). This is purely diagnostic — we then let libssh2 do its
+     * own parse during userauth_publickey_fromfile_ex. */
+    {
+        mbedtls_pk_context tctx;
+        mbedtls_pk_init(&tctx);
+        int mb_rc = mbedtls_pk_parse_keyfile(
+            &tctx, key_path,
+            (passphrase && *passphrase) ? passphrase : NULL);
+        if (mb_rc != 0) {
+            char mb_msg[80] = {0};
+            mbedtls_strerror(mb_rc, mb_msg, sizeof(mb_msg));
+            snprintf(err_buf, err_sz,
+                     "mbedTLS parse: rc=-0x%04X %s | path=%s",
+                     (unsigned)-mb_rc, mb_msg, key_path);
+            mbedtls_pk_free(&tctx);
+            abort_session(session, "mbedtls parse",
+                          sock, tailscale_conn, transport);
+            return NULL;
+        }
+        /* Stash success info into err_buf as a side-channel; if any later
+         * step fails, the caller will still see the type/bits we saw. */
+        snprintf(err_buf, err_sz, "(parse OK: %s %u-bit) ",
+                 mbedtls_pk_get_name(&tctx),
+                 (unsigned)mbedtls_pk_get_bitlen(&tctx));
+        mbedtls_pk_free(&tctx);
+    }
+
+    /* RSA pubkey from file. pubkey_path may be NULL — libssh2 derives it. */
+    int auth = libssh2_userauth_publickey_fromfile_ex(
+        session, user, (unsigned int)strlen(user),
+        pubkey_path, key_path,
+        passphrase ? passphrase : "");
+    if (auth != 0) {
+        char inner[160] = {0};
+        copy_libssh2_err(inner, sizeof(inner), session, "auth", auth);
+        /* Note: err_buf currently holds "(parse OK: RSA 4096-bit) " prefix
+         * from the mbedTLS pre-check success path; preserve it so we know
+         * mbedTLS itself parsed the key fine and the issue is downstream. */
+        char prefix[64] = {0};
+        snprintf(prefix, sizeof(prefix), "%.63s", err_buf);
+        snprintf(err_buf, err_sz,
+                 "%s%s | key_size=%ld user=%s methods=[%s]",
+                 prefix, inner, key_size, user, methods ? methods : "?");
+        abort_session(session, "auth failed",
+                      sock, tailscale_conn, transport);
+        return NULL;
+    }
+    /* Auth succeeded — clear the diagnostic prefix from err_buf. */
+    err_buf[0] = 0;
+
+    return finish_shell(session, sock, tailscale_conn, transport,
+                        pty_cols, pty_rows, err_buf, err_sz);
+}
+
+ssh_client_t *ssh_connect_password(const char *host, int port,
+                                   const char *user,
+                                   const char *password,
+                                   int pty_cols, int pty_rows,
+                                   ts3ds *tailscale,
+                                   char *err_buf, int err_sz) {
+    int sock;
+    ts3ds_conn *tailscale_conn;
+    ssh_transport *transport;
+
+    LIBSSH2_SESSION *session = dial_session(host, port, tailscale,
+                                            &sock, &tailscale_conn,
+                                            &transport, err_buf, err_sz);
+    if (!session) return NULL;
+
+    const char *methods = query_auth_methods(session, user);
+    if (methods && !strstr(methods, "password")) {
+        snprintf(err_buf, err_sz,
+                 "server rejects password auth for %s. Allowed: %s",
+                 user, methods);
+        abort_session(session, "no password method",
+                      sock, tailscale_conn, transport);
+        return NULL;
+    }
+
+    int auth = libssh2_userauth_password_ex(
+        session, user, (unsigned int)strlen(user),
+        password, (unsigned int)strlen(password), NULL);
+    if (auth != 0) {
+        char inner[160] = {0};
+        copy_libssh2_err(inner, sizeof(inner), session, "auth", auth);
+        snprintf(err_buf, err_sz,
+                 "%s | user=%s methods=[%s] "
+                 "(wrong password or server forbids password auth)",
+                 inner, user, methods ? methods : "?");
+        abort_session(session, "auth failed",
+                      sock, tailscale_conn, transport);
+        return NULL;
+    }
+    err_buf[0] = 0;
+
+    return finish_shell(session, sock, tailscale_conn, transport,
+                        pty_cols, pty_rows, err_buf, err_sz);
 }
 
 void ssh_disconnect(ssh_client_t *ssh) {

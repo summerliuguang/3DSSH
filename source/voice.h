@@ -42,6 +42,11 @@ typedef enum {
 voice_t *voice_init(void);
 void     voice_free(voice_t *v);
 
+/* Point plain (non-AI) voice transcription at an HTTP STT endpoint
+ * (e.g. mimo-voice-hub /api/stt).  Empty/NULL restores the default
+ * SSH-shim transport.  Call again after SETTINGS saves a new URL. */
+void     voice_set_api(voice_t *v, const char *url);
+
 /* Cancel recording/transcription before its SSH transport is destroyed. */
 void voice_abort(voice_t *v);
 

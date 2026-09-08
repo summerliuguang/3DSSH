@@ -217,6 +217,18 @@ struct softkb_t {
      * draw_status_row queries it each frame so the REC / spinner / ERR
      * badge preempts the modifier label. */
     const voice_t *voice;
+
+    /* ── Settings page state ──
+     * cfg points at main.c's ssh_config_t (NULL until softkb_set_config).
+     * set_srv is the server slot being viewed/edited (0-based, may point
+     * one past server_count = "new server" slot).  set_edit >= 0 means a
+     * field edit is in progress and set_edit_buf holds the working copy. */
+    ssh_config_t  *cfg;
+    int           settings_mode;
+    int           set_srv;
+    int           set_edit;
+    char          set_edit_buf[CONFIG_STR_MAX];
+    softkb_action_t set_action;
 };
 
 softkb_t *softkb_init(ime_t *ime) {
@@ -230,7 +242,36 @@ softkb_t *softkb_init(ime_t *ime) {
      * like the second half of a double-tap. */
     kb->badge_last_tap_frame = -1000;
     kb->ime = ime;
+    kb->cfg = NULL;
+    kb->settings_mode = 0;
+    kb->set_srv = 0;
+    kb->set_edit = -1;
+    kb->set_action = SOFTKB_ACT_NONE;
     return kb;
+}
+
+void softkb_set_config(softkb_t *kb, ssh_config_t *cfg) {
+    if (!kb) return;
+    kb->cfg = cfg;
+    if (cfg) kb->set_srv = cfg->active_server;
+}
+
+int softkb_in_settings(const softkb_t *kb) {
+    return kb ? kb->settings_mode : 0;
+}
+
+int softkb_settings_editing(const softkb_t *kb) {
+    return kb ? (kb->settings_mode && kb->set_edit >= 0) : 0;
+}
+
+/* Defined with the settings geometry below — needed early because
+ * main.c routes bottom-row taps through it. */
+static int setbtn_hit(int tx, int ty);
+int softkb_settings_button_hit(const softkb_t *kb, int tx, int ty);
+
+int softkb_settings_button_hit(const softkb_t *kb, int tx, int ty) {
+    (void)kb;
+    return setbtn_hit(tx, ty);
 }
 
 void softkb_free(softkb_t *kb) { free(kb); }
@@ -291,6 +332,203 @@ static int badge_hit(int tx, int ty) {
 static int dbg_toggle_hit(int tx, int ty) {
     return tx >= DBG_TOGGLE_X && tx < DBG_TOGGLE_X + DBG_TOGGLE_W &&
            ty >= DBG_TOGGLE_Y && ty < DBG_TOGGLE_Y + DBG_TOGGLE_H;
+}
+
+/* ── settings page geometry ────────────────────────────────────────── */
+
+/* Pinned SET button — bottom-right corner of the bottom row (the strip
+ * main.c owns for clock + mascot).  Drawn in normal AND settings mode;
+ * hidden on the debug page. */
+#define SETBTN_W     34
+#define SETBTN_H     22
+#define SETBTN_X     (320 - SETBTN_W - 2)    /* 284 */
+#define SETBTN_Y     (240 - SETBTN_H - 2)    /* 216 */
+
+#define SET_TITLE_Y    40
+#define SET_SEL_Y      58
+#define SET_SEL_H      18
+#define SET_SEL_BTN_W  20
+#define SET_SEL_L_X    8
+#define SET_SEL_R_X    76
+#define SET_ROW_Y0     82
+#define SET_ROW_H      15
+#define SET_ROW_LABEL_X  6
+#define SET_ROW_VALUE_X  72
+#define SET_ROW_VALUE_W  236   /* 72 + 236 = 308 */
+#define SET_BTN_Y      192
+#define SET_BTN_H      18
+#define SET_SAVE_X       6
+#define SET_SAVE_W      84
+#define SET_RECONN_X    98
+#define SET_RECONN_W   126
+#define SET_EDITBAR_Y  40
+#define SET_EDITBAR_H  34
+
+static int setbtn_hit(int tx, int ty) {
+    return tx >= SETBTN_X && tx < SETBTN_X + SETBTN_W &&
+           ty >= SETBTN_Y && ty < SETBTN_Y + SETBTN_H;
+}
+
+/* Field order = row order on the settings page. */
+typedef enum {
+    SET_FLD_HOST = 0,
+    SET_FLD_PORT,
+    SET_FLD_USER,
+    SET_FLD_AUTH,
+    SET_FLD_PASSWORD,
+    SET_FLD_KEYPATH,
+    SET_FLD_VOICEAPI,
+    SET_FLD_COUNT
+} settings_field_t;
+
+static const char *set_field_label(settings_field_t f) {
+    switch (f) {
+        case SET_FLD_HOST:     return "HOST";
+        case SET_FLD_PORT:     return "PORT";
+        case SET_FLD_USER:     return "USER";
+        case SET_FLD_AUTH:     return "AUTH";
+        case SET_FLD_PASSWORD: return "PASSWORD";
+        case SET_FLD_KEYPATH:  return "KEY PATH";
+        case SET_FLD_VOICEAPI: return "VOICE API";
+        default:               return "?";
+    }
+}
+
+/* Current value of a field as a display/edit string.  PORT goes through
+ * the caller's small scratch buffer. */
+static const char *set_field_value(const ssh_config_t *cfg, int slot,
+                                   settings_field_t f,
+                                   char *tmp, int tmp_sz) {
+    const ssh_server_t *s = &cfg->servers[slot];
+    switch (f) {
+        case SET_FLD_HOST:     return s->host;
+        case SET_FLD_PORT:     snprintf(tmp, (size_t)tmp_sz, "%d", s->port); return tmp;
+        case SET_FLD_USER:     return s->user;
+        case SET_FLD_AUTH:     return s->auth == SSH_AUTH_PASSWORD ? "password" : "key";
+        case SET_FLD_PASSWORD: return s->password;
+        case SET_FLD_KEYPATH:  return s->key_path;
+        case SET_FLD_VOICEAPI: return cfg->voice_api_url;
+        default:               return "";
+    }
+}
+
+static void set_field_commit(ssh_config_t *cfg, int slot,
+                             settings_field_t f, const char *val) {
+    ssh_server_t *s = &cfg->servers[slot];
+    switch (f) {
+        case SET_FLD_HOST:
+            snprintf(s->host, CONFIG_STR_MAX, "%s", val);
+            /* First host typed into an empty slot grows the server list. */
+            if (slot >= cfg->server_count && val[0])
+                cfg->server_count = slot + 1;
+            break;
+        case SET_FLD_PORT: {
+            int p = atoi(val);
+            if (p > 0 && p < 65536) s->port = p;
+            break;
+        }
+        case SET_FLD_USER:     snprintf(s->user, CONFIG_STR_MAX, "%s", val); break;
+        case SET_FLD_PASSWORD: snprintf(s->password, CONFIG_STR_MAX, "%s", val); break;
+        case SET_FLD_KEYPATH:  snprintf(s->key_path, CONFIG_STR_MAX, "%s", val); break;
+        case SET_FLD_VOICEAPI: snprintf(cfg->voice_api_url, CONFIG_STR_MAX, "%s", val); break;
+        default: break;
+    }
+}
+
+static void settings_begin_edit(softkb_t *kb, settings_field_t f) {
+    if (!kb->cfg) return;
+    char tmp[16];
+    const char *cur = set_field_value(kb->cfg, kb->set_srv, f,
+                                      tmp, (int)sizeof(tmp));
+    snprintf(kb->set_edit_buf, sizeof(kb->set_edit_buf), "%s", cur);
+    kb->set_edit = (int)f;
+}
+
+void softkb_settings_commit(softkb_t *kb) {
+    if (!kb || !kb->cfg || kb->set_edit < 0) return;
+    set_field_commit(kb->cfg, kb->set_srv,
+                     (settings_field_t)kb->set_edit, kb->set_edit_buf);
+    kb->set_edit = -1;
+}
+
+void softkb_settings_cancel(softkb_t *kb) {
+    if (!kb) return;
+    kb->set_edit = -1;
+}
+
+void softkb_settings_backspace(softkb_t *kb) {
+    if (!kb || kb->set_edit < 0) return;
+    int len = (int)strlen(kb->set_edit_buf);
+    if (len == 0) return;
+    len--;
+    /* Keep whole UTF-8 glyphs: strip continuation bytes back to the lead. */
+    while (len > 0 &&
+           ((unsigned char)kb->set_edit_buf[len] & 0xC0) == 0x80)
+        len--;
+    kb->set_edit_buf[len] = 0;
+}
+
+void softkb_settings_feed(softkb_t *kb, const char *bytes) {
+    if (!kb || !bytes || kb->set_edit < 0) return;
+    if (bytes[0] == '\x1b') return;   /* escape sequences aren't text */
+    int len = (int)strlen(kb->set_edit_buf);
+    for (const char *p = bytes; *p && len < CONFIG_STR_MAX - 1; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20) continue;       /* control bytes (tab, CR, …) */
+        kb->set_edit_buf[len++] = (char)c;
+    }
+    kb->set_edit_buf[len] = 0;
+}
+
+softkb_action_t softkb_settings_consume_action(softkb_t *kb) {
+    if (!kb) return SOFTKB_ACT_NONE;
+    softkb_action_t a = kb->set_action;
+    kb->set_action = SOFTKB_ACT_NONE;
+    return a;
+}
+
+static int set_row_hit(int tx, int ty) {
+    if (tx < 4 || tx > 316) return -1;
+    if (ty < SET_ROW_Y0 || ty >= SET_ROW_Y0 + SET_ROW_H * SET_FLD_COUNT)
+        return -1;
+    return (ty - SET_ROW_Y0) / SET_ROW_H;
+}
+
+/* Browse-mode taps: server selector, field rows, SAVE / RECONNECT. */
+static void settings_browse_tap(softkb_t *kb, int tx, int ty) {
+    ssh_config_t *cfg = kb->cfg;
+    if (!cfg) return;
+
+    if (ty >= SET_SEL_Y && ty < SET_SEL_Y + SET_SEL_H) {
+        if (tx >= SET_SEL_L_X && tx < SET_SEL_L_X + SET_SEL_BTN_W) {
+            if (kb->set_srv > 0) kb->set_srv--;
+        } else if (tx >= SET_SEL_R_X && tx < SET_SEL_R_X + SET_SEL_BTN_W) {
+            if (kb->set_srv < CONFIG_SERVERS_MAX - 1) kb->set_srv++;
+        }
+        /* Browsing also activates — but only a configured slot can be
+         * the active server, otherwise SELECT would dial an empty host. */
+        if (cfg->servers[kb->set_srv].host[0])
+            cfg->active_server = kb->set_srv;
+        return;
+    }
+
+    if (ty >= SET_BTN_Y && ty < SET_BTN_Y + SET_BTN_H) {
+        if (tx >= SET_SAVE_X && tx < SET_SAVE_X + SET_SAVE_W)
+            kb->set_action = SOFTKB_ACT_SAVE;
+        else if (tx >= SET_RECONN_X && tx < SET_RECONN_X + SET_RECONN_W)
+            kb->set_action = SOFTKB_ACT_RECONNECT;
+        return;
+    }
+
+    int row = set_row_hit(tx, ty);
+    if (row < 0) return;
+    if (row == SET_FLD_AUTH) {
+        ssh_server_t *s = &cfg->servers[kb->set_srv];
+        s->auth = (s->auth == SSH_AUTH_PASSWORD) ? SSH_AUTH_KEY
+                                                 : SSH_AUTH_PASSWORD;
+        return;
+    }
+    settings_begin_edit(kb, (settings_field_t)row);
 }
 
 static const softkey_t *current_layout(const softkb_t *kb, int *count) {
@@ -381,8 +619,43 @@ const char *softkb_touch(softkb_t *kb,
         return NULL;
     }
 
+    /* ── Pinned SET button: toggle the settings overlay.  Visible on
+     * the keyboard AND on the settings page (as its exit button); not
+     * on the debug page.  Ignore while a field edit is open so a
+     * mis-tap near the corner doesn't discard the buffer. ── */
+    if (setbtn_hit(tx, ty)) {
+        if (down_edge && kb->cfg && kb->set_edit < 0) {
+            kb->settings_mode = !kb->settings_mode;
+            if (kb->settings_mode) {
+                kb->set_edit = -1;
+                kb->set_srv = kb->cfg->active_server;
+            }
+        }
+        kb->repeat_idx = -2;
+        return NULL;
+    }
+
+    /* ── Settings page ── */
+    if (kb->settings_mode) {
+        if (kb->set_edit < 0) {
+            /* Browse mode: selector / rows / buttons. */
+            if (down_edge) settings_browse_tap(kb, tx, ty);
+            kb->repeat_idx = -2;
+            return NULL;
+        }
+        /* Edit mode: tapping the edit bar commits (same as A);
+         * everything else falls through to the keyboard layout. */
+        if (down_edge && ty >= SET_EDITBAR_Y &&
+            ty < SET_EDITBAR_Y + SET_EDITBAR_H) {
+            softkb_settings_commit(kb);
+            kb->repeat_idx = -2;
+            return NULL;
+        }
+    }
+
     /* ── IME candidate strip: tap on a visible candidate commits it. ── */
-    if (kb->ime && ime_active(kb->ime) && ty < STATUS_H) {
+    if (kb->ime && ime_active(kb->ime) && ty < STATUS_H &&
+        !kb->settings_mode) {
         if (down_edge) {
             for (int i = 0; i < kb->cand_box_n; i++) {
                 if (tx >= kb->cand_box_x[i] &&
@@ -442,9 +715,11 @@ const char *softkb_touch(softkb_t *kb,
     /* True iff we should route this tap through the IME instead of
      * sending it raw.  CN mode + a-z key + no held modifier → IME.
      * Modifiers (Shift/Ctrl/Alt) always bypass IME so Ctrl-C, Alt-b,
-     * etc. still work in CN mode. */
+     * etc. still work in CN mode.  Settings edit mode never routes to
+     * IME — field buffers take raw characters. */
     int route_to_ime =
         kb->ime &&
+        !kb->settings_mode &&
         keyboard_get_mode(kbd) == MODE_CN &&
         !keyboard_shift_held(kbd) &&
         !keyboard_ctrl_held(kbd) &&
@@ -755,7 +1030,7 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
 
     /* IME candidates over the strip (when buffer non-empty). */
     kb->cand_box_n = 0;
-    if (kb && kb->ime && ime_active(kb->ime)) {
+    if (kb && kb->ime && ime_active(kb->ime) && !kb->settings_mode) {
         draw_ime_strip(kb, strip_x, strip_end, slot_y);
     }
 
@@ -875,20 +1150,60 @@ static void draw_debug_screen(softkb_t *kb, renderer_t *r,
         DBG_TOGGLE_X + (DBG_TOGGLE_W - blen * CELL_W) / 2,
         DBG_TOGGLE_Y + (DBG_TOGGLE_H - CELL_H)   / 2,
         btn_label, COL_KEY_LABEL);
+
+    /* Voice transport status — shows which way plain voice recordings
+     * go (HTTP API endpoint vs SSH shim), for debugging "voice is not
+     * working" reports. */
+    if (kb->cfg) {
+        char voice_line[64];
+        snprintf(voice_line, sizeof(voice_line), "VOICE: %s",
+                 kb->cfg->voice_api_url[0] ? "HTTP API" : "SSH shim");
+        renderer_draw_text_px(8, kb_y + 70, voice_line, COL_KEY_LABEL);
+    }
 }
 
-/* ── public draw ───────────────────────────────────────────────────── */
+/* ── settings page ─────────────────────────────────────────────────── */
 
-void softkb_draw(softkb_t *kb, renderer_t *r, const keyboard_t *kbd) {
-    if (!kb || !r) return;
-
-    if (kb->debug_mode) {
-        draw_debug_screen(kb, r, kbd);
+/* Draw a value string clipped to max_px, walking whole UTF-8 glyphs. */
+static void draw_value_clipped(int x, int y, const char *val, int max_px,
+                               uint32_t color) {
+    if (!val[0]) {
+        renderer_draw_text_px(x, y, "(empty)", COL_STATUS_DIM);
         return;
     }
+    char glyph[5];
+    int w = 0;
+    int pos = 0;
+    while (val[pos]) {
+        int clen = 1;
+        unsigned char lead = (unsigned char)val[pos];
+        if (lead >= 0xF0)      clen = 4;
+        else if (lead >= 0xE0) clen = 3;
+        else if (lead >= 0xC0) clen = 2;
+        if ((int)strlen(val + pos) < clen) break;   /* torn tail */
+        memcpy(glyph, val + pos, (size_t)clen);
+        glyph[clen] = 0;
+        int cw = renderer_utf8_text_width_px(glyph);
+        if (w + cw > max_px) break;
+        renderer_draw_text_px(x + w, y, glyph, color);
+        w += cw;
+        pos += clen;
+    }
+}
 
-    draw_status_row(kb, r, kbd);
+static void draw_set_button(int active) {
+    draw_key_button(SETBTN_X, SETBTN_Y, SETBTN_W, SETBTN_H,
+                    active ? COL_KEY_PG_BODY : COL_KEY_BODY, 0);
+    const char *lbl = "SET";
+    int tw = (int)strlen(lbl) * CELL_W;
+    renderer_draw_text_px(SETBTN_X + (SETBTN_W - tw) / 2,
+                          SETBTN_Y + (SETBTN_H - CELL_H) / 2,
+                          lbl,
+                          active ? COL_KEY_PRESSED_FG : COL_KEY_LABEL);
+}
 
+/* Reusable keyboard-layout painter (normal mode and settings edit mode). */
+static void draw_keyboard_keys(softkb_t *kb) {
     int n;
     const softkey_t *layout = current_layout(kb, &n);
     for (int i = 0; i < n; i++) {
@@ -908,4 +1223,127 @@ void softkb_draw(softkb_t *kb, renderer_t *r, const keyboard_t *kbd) {
         draw_key_button(k->x, k->y, k->w, k->h, body, depth);
         draw_label(k->x, k->y, k->w, k->h, k->label, lbl, depth);
     }
+}
+
+static void draw_settings_screen(softkb_t *kb, renderer_t *r,
+                                 const keyboard_t *kbd) {
+    C2D_DrawRectSolid(0, 0, 0.05f, 320, 240,
+                      rgba_to_c2d_(COL_STATUS_BG));
+    draw_status_row(kb, r, kbd);
+
+    /* ── Edit mode: field bar + keyboard pages ── */
+    if (kb->set_edit >= 0) {
+        C2D_DrawRectSolid(0, (float)SET_EDITBAR_Y, 0.06f, 320,
+                          (float)SET_EDITBAR_H,
+                          rgba_to_c2d_(COL_CANDIDATE_BG));
+        char title[48];
+        snprintf(title, sizeof(title), "%s:",
+                 set_field_label((settings_field_t)kb->set_edit));
+        renderer_draw_text_px(6, SET_EDITBAR_Y + 3, title, COL_STATUS_FG_HOLD);
+        /* Field value (plaintext while editing — you need to see what
+         * you type; passwords revert to the masked row once committed). */
+        draw_value_clipped(6 + renderer_utf8_text_width_px(title) + 4,
+                           SET_EDITBAR_Y + 3, kb->set_edit_buf,
+                           320 - 24, COL_KEY_LABEL);
+        renderer_draw_text_px(6, SET_EDITBAR_Y + 18,
+                              "A=ok   B=del   SELECT=cancel   tap bar=ok",
+                              COL_STATUS_DIM);
+
+        draw_keyboard_keys(kb);
+        return;
+    }
+
+    /* ── Browse mode ── */
+    renderer_draw_text_px(6, SET_TITLE_Y, "SETTINGS", COL_STATUS_FG_HOLD);
+    renderer_draw_text_px(70, SET_TITLE_Y, "tap SET to close",
+                          COL_STATUS_DIM);
+
+    /* Server selector: [<] SRV n/N [>] — browsing also activates the
+     * slot when it has a host. */
+    draw_key_button(SET_SEL_L_X, SET_SEL_Y, SET_SEL_BTN_W, SET_SEL_H,
+                    COL_KEY_BODY, 0);
+    draw_key_button(SET_SEL_R_X, SET_SEL_Y, SET_SEL_BTN_W, SET_SEL_H,
+                    COL_KEY_BODY, 0);
+    draw_label(SET_SEL_L_X, SET_SEL_Y, SET_SEL_BTN_W, SET_SEL_H,
+               "<", COL_KEY_LABEL, 0);
+    draw_label(SET_SEL_R_X, SET_SEL_Y, SET_SEL_BTN_W, SET_SEL_H,
+               ">", COL_KEY_LABEL, 0);
+    char sel_lbl[40];
+    snprintf(sel_lbl, sizeof(sel_lbl), "SRV %d/%d %s",
+             kb->set_srv + 1, CONFIG_SERVERS_MAX,
+             (kb->cfg && kb->set_srv == kb->cfg->active_server &&
+              kb->cfg->servers[kb->set_srv].host[0]) ? "(active)" : "");
+    int sel_lbl_w = (int)strlen(sel_lbl) * CELL_W;
+    renderer_draw_text_px((320 - sel_lbl_w) / 2, SET_SEL_Y + 3,
+                          sel_lbl,
+                          (kb->cfg && kb->set_srv == kb->cfg->active_server)
+                              ? COL_STATUS_FG_HOLD : COL_KEY_LABEL);
+
+    /* Field rows. */
+    if (kb->cfg) {
+        char tmp[16];
+        for (int f = 0; f < SET_FLD_COUNT; f++) {
+            int ry = SET_ROW_Y0 + f * SET_ROW_H;
+            const char *label = set_field_label((settings_field_t)f);
+            renderer_draw_text_px(SET_ROW_LABEL_X,
+                                  ry + (SET_ROW_H - CELL_H) / 2,
+                                  label, COL_KEY_LABEL);
+            draw_key_button(SET_ROW_VALUE_X, ry + 1,
+                            SET_ROW_VALUE_W, SET_ROW_H - 2,
+                            COL_KEY_SPECIAL, 0);
+            const char *val = set_field_value(kb->cfg, kb->set_srv,
+                                              (settings_field_t)f,
+                                              tmp, (int)sizeof(tmp));
+            int vy = ry + (SET_ROW_H - CELL_H) / 2;
+            if (f == SET_FLD_AUTH) {
+                /* Auth is a toggle, not an edit field — highlight it. */
+                renderer_draw_text_px(SET_ROW_VALUE_X + 6, vy,
+                                      strcmp(val, "password") == 0
+                                          ? "PWD LOGIN" : "KEY (RSA)",
+                                      COL_STATUS_FG_HOLD);
+            } else if (f == SET_FLD_PASSWORD) {
+                renderer_draw_text_px(SET_ROW_VALUE_X + 6, vy,
+                                      val[0] ? "********" : "",
+                                      COL_KEY_LABEL);
+                if (!val[0])
+                    renderer_draw_text_px(SET_ROW_VALUE_X + 6, vy,
+                                          "(empty)", COL_STATUS_DIM);
+            } else {
+                draw_value_clipped(SET_ROW_VALUE_X + 6, vy, val,
+                                   SET_ROW_VALUE_W - 12, COL_KEY_LABEL);
+            }
+        }
+    }
+
+    /* SAVE / RECONNECT buttons. */
+    draw_key_button(SET_SAVE_X, SET_BTN_Y, SET_SAVE_W, SET_BTN_H,
+                    COL_KEY_PG_BODY, 0);
+    draw_label(SET_SAVE_X, SET_BTN_Y, SET_SAVE_W, SET_BTN_H,
+               "SAVE", COL_KEY_PRESSED_FG, 0);
+    draw_key_button(SET_RECONN_X, SET_BTN_Y, SET_RECONN_W, SET_BTN_H,
+                    COL_KEY_BODY, 0);
+    draw_label(SET_RECONN_X, SET_BTN_Y, SET_RECONN_W, SET_BTN_H,
+               "RECONNECT", COL_KEY_LABEL, 0);
+
+    draw_set_button(1);
+}
+
+/* ── public draw ───────────────────────────────────────────────────── */
+
+void softkb_draw(softkb_t *kb, renderer_t *r, const keyboard_t *kbd) {
+    if (!kb || !r) return;
+
+    if (kb->debug_mode) {
+        draw_debug_screen(kb, r, kbd);
+        return;
+    }
+
+    if (kb->settings_mode) {
+        draw_settings_screen(kb, r, kbd);
+        return;
+    }
+
+    draw_status_row(kb, r, kbd);
+    draw_keyboard_keys(kb);
+    draw_set_button(0);
 }

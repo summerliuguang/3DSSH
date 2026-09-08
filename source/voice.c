@@ -1,4 +1,5 @@
 #include "voice.h"
+#include "voice_api.h"
 #include "ssh_client.h"
 
 #include <3ds.h>
@@ -38,6 +39,12 @@
 #define WRITE_CHUNK_BYTES  4096
 #define REPLY_BUF_SIZE     8192       /* AI JSON envelopes are bigger */
 
+/* HTTP-API transcribe cap: after 20 s of no response we give up and reap
+ * the worker thread (release_aux joins it — bounded by the 3DS HTTP
+ * service's own timeouts).  Keeps the spinner from spinning forever when
+ * a server is reachable but unresponsive. */
+#define HTTP_TIMEOUT_FRAMES (60 * 20)
+
 #define AI_HISTORY_MAX     5
 #define AI_Q_MAX           512
 #define AI_A_MAX           4096
@@ -50,11 +57,30 @@
 #define WHISPER_SHIM_CMD       "~/.local/bin/dssh-whisper-shim"
 #define WHISPER_SHIM_ASK_CMD   "~/.local/bin/dssh-whisper-shim --ask"
 
+/* Actual sample rate behind MICU_SAMPLE_RATE_16360 — goes into the WAV
+ * header when the recording ships to the HTTP voice API. */
+#define MIC_SAMPLE_RATE 16360
+
+/* xfer_phase value for the HTTP-API transport (SSH aux uses 0/1/2). */
+#define XFER_PHASE_HTTP 3
+
 struct voice_t {
     voice_state_t state;
     int           state_frame;        /* per-tick counter for animation/timeouts */
 
     int           ai_mode;            /* 1 if current cycle is AI-ask */
+
+    /* HTTP voice-API transport.  When api_url is non-empty, plain (non-AI)
+     * recordings POST to it from a worker thread instead of the SSH shim.
+     * The thread writes reply_buf/reply_len/http_err, then sets http_done
+     * under http_lock; voice_tick joins the thread once done is seen. */
+    char          api_url[256];
+    Thread        http_thread;
+    LightLock     http_lock;
+    volatile int  http_done;
+    volatile int  http_ok;
+    int           http_active;
+    char          http_err[40];
 
     uint8_t      *mic_buf;
     uint32_t      mic_buf_size;
@@ -108,7 +134,10 @@ static void enter_idle(voice_t *v) {
 static void enter_error(voice_t *v, const char *msg) {
     v->state = VOICE_ERROR;
     v->state_frame = 0;
-    if (msg) snprintf(v->err_msg, sizeof(v->err_msg), "%s", msg);
+    if (msg) {
+        strncpy(v->err_msg, msg, sizeof(v->err_msg) - 1);
+        v->err_msg[sizeof(v->err_msg) - 1] = 0;
+    }
 }
 
 /* Length in bytes of the UTF-8 codepoint starting at b (1..4), or 1 for
@@ -161,6 +190,15 @@ static void flush_typing(voice_t *v, ssh_client_t *ssh) {
 }
 
 static void release_aux(voice_t *v) {
+    /* If an HTTP transcribe thread is in flight, reap it before touching
+     * the buffers it reads (xfer_buf/xfer_owned).  Joining can block for
+     * the rest of the LAN request — acceptable for the rare cancel case. */
+    if (v->http_thread) {
+        threadJoin(v->http_thread, U64_MAX);
+        threadFree(v->http_thread);
+        v->http_thread = NULL;
+    }
+    v->http_active = 0;
     if (v->aux) {
         ssh_aux_close(v->aux);
         v->aux = NULL;
@@ -172,6 +210,30 @@ static void release_aux(voice_t *v) {
     v->xfer_buf = NULL;
     v->xfer_len = 0;
     v->xfer_pos = 0;
+}
+
+/* ── HTTP voice-API transport ──────────────────────────────────────── */
+
+void voice_set_api(voice_t *v, const char *url) {
+    if (!v) return;
+    snprintf(v->api_url, sizeof(v->api_url), "%s", url ? url : "");
+}
+
+/* Worker thread: POST the framed WAV and stash the response.  Runs
+ * detached from the 60 fps loop; voice_tick polls http_done. */
+static void http_thread_main(void *arg) {
+    voice_t *v = (voice_t *)arg;
+    char err[40] = {0};
+    int n = voice_api_post(v->api_url,
+                           v->xfer_buf, (int)v->xfer_len,
+                           v->reply_buf, (int)sizeof(v->reply_buf),
+                           err, (int)sizeof(err));
+    LightLock_Lock(&v->http_lock);
+    v->http_ok   = n >= 0;
+    v->reply_len = n > 0 ? n : 0;
+    snprintf(v->http_err, sizeof(v->http_err), "%s", err);
+    v->http_done = 1;
+    LightLock_Unlock(&v->http_lock);
 }
 
 static int start_recording(voice_t *v) {
@@ -393,6 +455,42 @@ static void begin_transcribe(voice_t *v, ssh_client_t *ssh) {
         return;
     }
 
+    /* Plain voice + configured HTTP API → ship WAV from a worker thread.
+     * (AI-ask keeps the SSH-shim path: the shim is what owns DeepSeek.) */
+    if (!v->ai_mode && v->api_url[0]) {
+        uint32_t total = VOICE_API_WAV_TOTAL(v->pcm_len);
+        v->xfer_owned = (uint8_t *)malloc(total);
+        if (!v->xfer_owned) { enter_error(v, "wav oom"); return; }
+        if (voice_api_wav_header(v->xfer_owned, VOICE_API_WAV_HEADER,
+                                 v->pcm_len, MIC_SAMPLE_RATE) < 0) {
+            free(v->xfer_owned); v->xfer_owned = NULL;
+            enter_error(v, "wav hdr");
+            return;
+        }
+        memcpy(v->xfer_owned + VOICE_API_WAV_HEADER, v->mic_buf, v->pcm_len);
+        v->xfer_buf = v->xfer_owned;
+        v->xfer_len = total;
+
+        v->http_done = 0;
+        v->http_ok   = 0;
+        v->http_err[0] = 0;
+        v->reply_len = 0;
+        v->http_thread = threadCreate(http_thread_main, v, 32 * 1024,
+                                      0x3F, -2, false);
+        if (!v->http_thread) {
+            free(v->xfer_owned); v->xfer_owned = NULL;
+            v->xfer_buf = NULL; v->xfer_len = 0;
+            enter_error(v, "thread");
+            return;
+        }
+        v->http_active = 1;
+
+        v->state       = VOICE_TRANSCRIBING;
+        v->state_frame = 0;
+        v->xfer_phase  = XFER_PHASE_HTTP;
+        return;
+    }
+
     /* Build the upload payload depending on AI mode.
      *   non-AI: just send raw PCM (xfer_buf = mic_buf).
      *   AI:     prefix with 4-byte BE PCM length, then PCM, then
@@ -503,6 +601,7 @@ static void finish_ai_transcribe(voice_t *v) {
 voice_t *voice_init(void) {
     voice_t *v = calloc(1, sizeof(*v));
     if (!v) return NULL;
+    LightLock_Init(&v->http_lock);
     v->mic_buf = memalign(MIC_BUFFER_ALIGN, MIC_BUFFER_SIZE);
     if (!v->mic_buf) { free(v); return NULL; }
     v->mic_buf_size = MIC_BUFFER_SIZE;
@@ -644,6 +743,75 @@ void voice_tick(voice_t *v, ssh_client_t *ssh) {
             break;
 
         case VOICE_TRANSCRIBING: {
+            /* HTTP voice-API path: worker thread is doing the whole
+             * POST; just poll for completion. */
+            if (v->xfer_phase == XFER_PHASE_HTTP) {
+                int done;
+                LightLock_Lock(&v->http_lock);
+                done = v->http_done;
+                LightLock_Unlock(&v->http_lock);
+                if (!done) {
+                    /* Server reachable but unresponsive: give up after
+                     * the cap.  release_aux joins the worker (blocking
+                     * until the HTTP service unwinds) then frees the
+                     * upload buffer it is reading from. */
+                    if (v->state_frame >= HTTP_TIMEOUT_FRAMES) {
+                        release_aux(v);
+                        enter_error(v, "http timeout");
+                    }
+                    break;
+                }
+
+                /* Reap the thread before reading its outputs. */
+                threadJoin(v->http_thread, U64_MAX);
+                threadFree(v->http_thread);
+                v->http_thread = NULL;
+                v->http_active = 0;
+                if (v->xfer_owned) {
+                    free(v->xfer_owned);
+                    v->xfer_owned = NULL;
+                }
+                v->xfer_buf = NULL;
+                v->xfer_len = 0;
+
+                if (!v->http_ok) {
+                    enter_error(v, v->http_err[0] ? v->http_err
+                                                  : "http fail");
+                    break;
+                }
+
+                /* Response body is {"text": "..."} — extract and type it
+                 * into the shell exactly like the shim path.  A JSON
+                 * error body has no "text"; surface it as an ERR. */
+                char text[1024] = {0};
+                int body_len = v->reply_len > 0
+                             ? v->reply_len
+                             : (int)strlen(v->reply_buf);
+                if (json_find_string_field(v->reply_buf, body_len,
+                                           "text",
+                                           text, (int)sizeof(text)) == 0 &&
+                    text[0]) {
+                    snprintf(v->reply_buf, sizeof(v->reply_buf), "%s", text);
+                    v->reply_len = (int)strlen(text);
+                    enter_typing(v);
+                } else {
+                    char err_txt[40] = {0};
+                    if (json_find_string_field(v->reply_buf, body_len,
+                                               "error",
+                                               err_txt,
+                                               (int)sizeof(err_txt)) == 0 &&
+                        err_txt[0]) {
+                        /* UTF-8 CJK in a 3-char slot won't render — show
+                         * a generic tag; the body stays in debug recv. */
+                        (void)err_txt;
+                        enter_error(v, "api error");
+                    } else {
+                        enter_error(v, "api empty");
+                    }
+                }
+                break;
+            }
+
             if (!v->aux) { enter_error(v, "aux gone"); break; }
 
             if (v->xfer_phase == 0) {

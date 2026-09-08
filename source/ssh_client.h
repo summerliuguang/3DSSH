@@ -3,14 +3,16 @@
 
 /*
  * Thin wrapper around libssh2 for the 3DS.
- * RSA-4096 public-key authentication (mbedTLS backend doesn't support ed25519).
- * Single shell channel per connection, non-blocking I/O after handshake.
+ * Public-key auth (RSA via mbedTLS — the backend doesn't support ed25519)
+ * and plain password auth.  Single shell channel per connection,
+ * non-blocking I/O after handshake.
  */
 
 typedef struct ssh_client_t ssh_client_t;
 typedef struct ts3ds ts3ds;
 
-/* Connect, authenticate, open shell with PTY. Returns NULL on any failure.
+/* Connect + authenticate with a PEM private key, then open shell with PTY.
+ * Returns NULL on any failure.
  *   key_path        — path to PEM-format RSA private key (e.g. "sdmc:/3ds/3dssh/id_rsa").
  *   pubkey_path     — public key path or NULL to let libssh2 derive from private.
  *   passphrase      — passphrase for encrypted key, or NULL for unencrypted keys.
@@ -26,6 +28,16 @@ ssh_client_t *ssh_connect_pubkey(const char *host, int port,
                                  int pty_cols, int pty_rows,
                                  ts3ds *tailscale,
                                  char *err_buf, int err_sz);
+
+/* Same contract as ssh_connect_pubkey but authenticates with a plain
+ * password (libssh2 userauth_password).  Used when the active server
+ * config selects auth = "password". */
+ssh_client_t *ssh_connect_password(const char *host, int port,
+                                   const char *user,
+                                   const char *password,
+                                   int pty_cols, int pty_rows,
+                                   ts3ds *tailscale,
+                                   char *err_buf, int err_sz);
 
 void ssh_disconnect(ssh_client_t *ssh);
 int  ssh_is_connected(ssh_client_t *ssh);
