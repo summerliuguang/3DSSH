@@ -30,7 +30,9 @@ build/test_ime
 test_ime
 
 # Test screenshots & SD card snapshots (Mac extracted ._* metadata + key)
-3dssh/
+# (anchored to repo root — unanchored "3dssh/" also swallowed
+#  sd_template/3ds/3dssh/, which holds the tracked config.ini.example)
+/3dssh/
 *.HEIC
 *.heic
 *.MOV
