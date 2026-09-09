@@ -78,6 +78,10 @@
   vim keep running), switching is instant and independent.  Each window
   owns a terminal (~0.6 MB incl. 500-line scrollback); four windows add
   ~2.5 MB total — negligible on a 64 MB 3DS.
+- **Separate identity (DSSH+)** — this fork's CIA ships with its own
+  Title ID (UniqueId `0xFF55D`, blue double-chevron icon) so it
+  installs **alongside** upstream DSSH (`0xFF55C`) instead of
+  overwriting it; it shows on the HOME menu as "DSSH+".
 - **HTTP voice API (v1.2)** — START recordings can go straight to a
   LAN speech-to-text server (e.g. mimo-voice-hub's `/api/stt`); the
   transcribed text lands in the terminal.  L+START AI ask still uses

@@ -181,9 +181,9 @@ icon.png $(CIA_ASSETS)/banner.png $(CIA_ASSETS)/silent.wav: \
 # (selected-card image + audio).
 $(BUILD)/dssh.smdh: icon.png
 	@$(CIA_PATH_PREPEND) bannertool makesmdh \
-		-s "DSSH" \
-		-l "DSSH — SSH client with Chinese IME" \
-		-p "exdekotive" \
+		-s "DSSH+" \
+		-l "DSSH+ — multi-window SSH fork" \
+		-p "summerliuguang" \
 		-i icon.png \
 		-o $@ >/dev/null
 

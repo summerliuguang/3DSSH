@@ -6,8 +6,8 @@
 # real Nintendo titles.
 
 BasicInfo:
-  Title                   : "DSSH"
-  ProductCode             : "CTR-P-DSSH"
+  Title                   : "DSSH+"
+  ProductCode             : "CTR-P-DSSHP"
   Logo                    : Homebrew
 
 RomFs:
@@ -15,7 +15,9 @@ RomFs:
 
 TitleInfo:
   Category                : Application
-  UniqueId                : 0xFF55C   # "FF55C" — homebrew SSH client
+  # 0xFF55D — one step above upstream DSSH (0xFF55C) so this fork
+  # installs ALONGSIDE the original instead of overwriting it.
+  UniqueId                : 0xFF55D
 
 Option:
   UseOnSD                 : true

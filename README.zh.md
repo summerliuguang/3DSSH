@@ -65,6 +65,9 @@
   服务器窗口；后台窗口的 SSH 会话**保持在线**（tmux/vim 照常运行），
   切换瞬时完成、互不干扰。每窗口一个独立终端（约 0.6 MB，含 500 行
   scrollback），4 窗口总增量 ~2.5 MB，对 64 MB 内存的 3DS 毫无压力。
+- **独立身份（DSSH+）**：本 fork 的 CIA 使用独立 Title ID
+  （UniqueId `0xFF55D`，图标为蓝底双箭头），与上游 DSSH（`0xFF55C`）
+  **可共存**，互不覆盖；HOME 菜单里显示为 "DSSH+"。
 - **HTTP 语音 API（v1.2 新增）**：START 的录音可改为直接 POST 给
   局域网转文字服务器（如 mimo-voice-hub 的 `/api/stt`），返回文字
   打进终端；`L+START` AI 问答仍走 SSH shim。
