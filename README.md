@@ -82,7 +82,7 @@ Everything below documents **this fork**, not upstream.
   CJK unified ideographs, Terminus 6×12 for ASCII; mixed CJK/ASCII
   baselines align cleanly on the same line.
 - **Self-drawn soft keyboard** — iOS-style 3px rounded keys with smooth
-  press-down animation; letters / symbols pages; key-click sound effect.
+  press-down animation; letters / symbols pages.
 - **Pinyin input method** — top 300k entries from rime-ice, plus
   abbreviation matching (`nh` → 你好), prefix fallback (`nihaoz`
   auto-falls-back to `nihao`), and a candidate cursor.
@@ -785,8 +785,7 @@ What it shows:
 
 - Title + exit hint.
 - **recv hex**: the last 32 bytes received from SSH — for diagnosing
-  ANSI / SCS / mouse-protocol issues at the byte level; HTTP-voice
-  error response bodies also land here.
+  ANSI / SCS / mouse-protocol issues at the byte level.
 - **Voice backend line**: `VOICE: HTTP API` or `VOICE: SSH shim`.
 - **Physical key cheat sheet**: a condensed version of the bindings
   table above.
