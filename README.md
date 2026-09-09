@@ -2,10 +2,10 @@
   <b>English</b> · <a href="README.zh.md">中文</a>
 </p>
 
-<h1 align="center">DSSH</h1>
+<h1 align="center">DSSH+</h1>
 
 <p align="center">
-  <img src="icon.png" alt="DSSH icon" width="96" height="96">
+  <img src="icon.png" alt="DSSH+ icon" width="96" height="96">
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/media/preview.gif" alt="DSSH live demo" width="540"><br>
+  <img src="docs/media/preview.gif" alt="DSSH+ live demo" width="540"><br>
   <sub>Real New 2DS XL · top screen ANSI terminal · bottom screen soft
   keyboard + clock + crab</sub>
 </p>
@@ -44,62 +44,96 @@
 
 ---
 
+## About this fork
+
+This is **DSSH+**, a fork of
+[Fishason/DSSH](https://github.com/Fishason/DSSH) — which itself grew
+out of [skmtrd/3dssh](https://github.com/skmtrd/3dssh), the original
+3DS SSH client.  Upstream DSSH contributed the pinyin IME, the soft
+keyboard, and cloud voice input; **this fork continues from there** and
+concentrates on making the device self-serviceable:
+
+- **On-device settings (v1.2)** — edit up to 4 server profiles
+  (including password auth) and the voice API URL directly on the 3DS;
+  SAVE writes them back to the SD card.  No more hand-crafting
+  `config.ini` on a PC.
+- **SSH windows (v1.3)** — up to 4 servers connected at once; switching
+  windows is instant and background sessions keep running.
+- **HTTP voice API (v1.2)** — START recordings can go straight to a
+  self-hosted speech-to-text server over HTTP, no OpenRouter key
+  required for that path.
+- **Separate CIA identity** — this fork's CIA ships as **DSSH+**
+  (UniqueId `0xFF55D`, blue double-chevron icon) so it installs
+  **alongside** upstream DSSH (`0xFF55C`) instead of overwriting it.
+- **Real-device fixes** — voice-backend init and error reporting,
+  mouse-wheel targeting for full-screen TUIs, settings edit bar no
+  longer covers part of the keyboard, and more (see the
+  [commit history](../../commits)).
+
+Everything below documents **this fork**, not upstream.
+
 ## Features
+
+*Terminal & input*
 
 - **Full ANSI / VT100 terminal** — tmux status bar, claude-code spinner,
   box-drawing borders, 256-color, TrueColor, Braille; everything renders.
-- **Chinese rendering** — bundled Zpix 12px pixel font covers 21,000+ CJK
-  unified ideographs, Terminus 6×12 for ASCII; mixed CJK/ASCII baselines
-  align cleanly on the same line.
+- **Chinese rendering** — bundled Zpix 12px pixel font covers 21,000+
+  CJK unified ideographs, Terminus 6×12 for ASCII; mixed CJK/ASCII
+  baselines align cleanly on the same line.
 - **Self-drawn soft keyboard** — iOS-style 3px rounded keys with smooth
-  press-down animation; letters / symbols pages.
+  press-down animation; letters / symbols pages; key-click sound effect.
 - **Pinyin input method** — top 300k entries from rime-ice, plus
   abbreviation matching (`nh` → 你好), prefix fallback (`nihaoz`
   auto-falls-back to `nihao`), and a candidate cursor.
+- **Full physical-key mapping** — D-pad arrow keys, hold-style modifiers
+  (L = Shift, Y = Ctrl, X = Alt), Circle Pad scrollback / mouse-wheel.
+
+*Voice*
+
 - **Voice input (v1.0)** — press **START**, speak a Chinese sentence,
-  press **START** again; ~1-2 s later the transcribed text drops
-  straight into the SSH terminal.  Default backend is OpenRouter
-  Whisper Large V3 Turbo over the cloud (`$0.04` per audio-hour); a
-  self-hosted whisper.cpp track is available if you'd rather not depend
-  on an external API.
-- **Voice AI ask (NEW in v1.1)** — hold **L** and press **START** to
-  ask DeepSeek-Chat a question by voice; the answer pops up in a
-  bottom-screen modal with markdown-styled rendering (headers in
-  yellow, code in cyan, bullets, etc.) without disturbing the SSH
-  session above.  Press **A** in the modal to keep history for follow-
-  up questions, **B** to clear and start a new conversation.
+  press **START** again; a second later the transcribed text drops
+  straight into the SSH terminal.
+- **Voice AI ask (v1.1)** — hold **L** and press **START** to ask
+  DeepSeek-Chat a question by voice; the answer pops up in a
+  bottom-screen modal with markdown-styled rendering, without disturbing
+  the SSH session above.
+- **HTTP voice API (v1.2)** — START recordings can instead POST to any
+  self-hosted STT endpoint answering `{"text": "..."}`.
+
+*Connection & auth*
+
+- **RSA-4096 public-key auth** — libssh2 + mbedTLS, private key read
+  from the SD card; **password auth** also available (v1.2).
+- **Native Tailscale transport** — optionally join the 3DS to a tailnet
+  and carry SSH over direct UDP, Tailscale Peer Relay, or DERP without
+  running Go or `tailscaled`.
+
+*Fork highlights*
+
 - **On-device multi-server settings (v1.2)** — a **SET** button pinned
   to the keyboard's bottom-right opens a settings page: up to 4
   servers, HOST/PORT/USER editing, **password login** or RSA pubkey,
-  voice API URL, SAVE back to the SD card and one-tap RECONNECT.  No
-  more hand-crafting config.ini.
+  voice API URL, SAVE back to the SD card and one-tap RECONNECT.
 - **SSH windows (v1.3)** — a **WIN** button next to SET cycles through
   the configured servers.  Background windows stay **online** (tmux and
   vim keep running), switching is instant and independent.  Each window
   owns a terminal (~0.6 MB incl. 500-line scrollback); four windows add
   ~2.5 MB total — negligible on a 64 MB 3DS.
-- **Separate identity (DSSH+)** — this fork's CIA ships with its own
-  Title ID (UniqueId `0xFF55D`, blue double-chevron icon) so it
-  installs **alongside** upstream DSSH (`0xFF55C`) instead of
-  overwriting it; it shows on the HOME menu as "DSSH+".
-- **HTTP voice API (v1.2)** — START recordings can go straight to a
-  LAN speech-to-text server (e.g. mimo-voice-hub's `/api/stt`); the
-  transcribed text lands in the terminal.  L+START AI ask still uses
-  the SSH shim.
-- **RSA-4096 public-key auth** — libssh2 + mbedTLS, private key read
-  from the SD card.
-- **Native Tailscale transport** — optionally join the 3DS to a tailnet and
-  carry SSH over direct UDP, Tailscale Peer Relay, or DERP without running Go
-  or `tailscaled`.
-- **Full physical-key mapping** — D-pad arrow keys, hold-style modifiers
-  (L = Shift, Y = Ctrl, X = Alt), Circle Pad scrollback / mouse-wheel.
+- **Separate identity (DSSH+)** — installs alongside upstream DSSH, see
+  [About this fork](#about-this-fork).
+
+*Extras*
+
 - **Anthropic-red crab mascot** — scampers along the bottom row, dodges
   when you tap it 🦀.
 - **Hidden debug page** — double-tap the ENG/CHN badge to see the live
-  SSH byte stream, full key-binding cheat sheet, and a mascot toggle.
+  SSH byte stream, the current voice backend, full key-binding cheat
+  sheet, and a mascot toggle.
 
 ## Table of contents
 
+- [About this fork](#about-this-fork)
 - [Install](#install)
 - [Server-side setup](#server-side-setup-one-time)
 - [Configure config.ini](#configure-configini)
@@ -116,20 +150,23 @@
 
 ## Install
 
-DSSH runs on a **modded 3DS / 2DS / New 3DS**.  You need either the
+DSSH+ runs on a **modded 3DS / 2DS / New 3DS**.  You need either the
 Homebrew Launcher (HBL) or a CIA installer like FBI.
 
 ### Option A — `.cia` install (recommended)
 
-1. Grab `DSSH.cia` (~14 MB) from the [latest release](../../releases/latest).
+1. Grab `DSSH.cia` (~14 MB) from this repo's
+   [Releases](../../releases).
 2. Copy it anywhere on the SD card (e.g. `/cias/DSSH.cia`).
 3. Open FBI → SD → select `DSSH.cia` → `Install CIA`.
-4. The orange DSSH icon shows up on the HOME menu.
+4. The blue double-chevron **DSSH+** icon shows up on the HOME menu.
+   It is a separate title (UniqueId `0xFF55D`), so an existing upstream
+   DSSH install (`0xFF55C`) keeps working untouched.
 
 ### Option B — `.3dsx` direct launch
 
 1. Grab `3dssh.3dsx` from the latest release.
-2. Copy to `/3ds/dssh/dssh.3dsx` on the SD card.
+2. Copy to `/3ds/3dssh/3dssh.3dsx` on the SD card.
 3. Open HBL → pick DSSH.
 
 ### Option C — `3dslink` over Wi-Fi (developer flow)
@@ -190,6 +227,11 @@ Copy the **private key** `~/.ssh/id_rsa_3ds` onto the SD card at
 > ⚠️ The SD card stores the key in plain text.  Anyone holding the SD
 > can log in to your server.  Add `from="..."` IP restriction or
 > `command="..."` lockdown in `authorized_keys`.
+
+Password auth is an alternative to keys — set it in the settings page
+or `config.ini` (see next section).  The password is stored in
+plaintext on the SD card, so a key with `from=` restriction is still
+the safer default.
 
 ---
 
@@ -303,7 +345,6 @@ The state file contains private machine, WireGuard, and DISCO identity keys.
 Treat both it and the auth key as secrets. This is an unofficial community
 integration and is not affiliated with or endorsed by Tailscale Inc.
 
-
 Final SD layout:
 
 ```
@@ -317,27 +358,30 @@ sdmc:/3ds/3dssh/
 
 ## Voice input
 
-> **TL;DR**: install the **API track** (one curl + one API key, ~30 KB
-> on disk, ~1-2 s end-to-end).  The self-hosted track exists for
-> completeness but is *not recommended* for typical servers — see the
-> warning at the bottom of this section.
-
 Press **START** on the 3DS, speak a Chinese sentence, press **START**
 again — the transcribed UTF-8 text drops into the SSH terminal as if
 you had typed it.  Full sentences flow into Claude Code without ever
 opening the soft keyboard.
 
-The 3DS records 16 kHz PCM mono via its built-in microphone, ships up
-to 8 seconds of audio over a **second libssh2 channel** on the same
-SSH session (no new ports, no new auth, no firewall changes), and a
-small server-side shim transcribes via Whisper.
+The 3DS records 16 kHz PCM mono via its built-in microphone (a
+recording caps at ~30 s — the 1 MB mic buffer holds ~32 s and a
+software timer stops just before that) and ships it to one of three
+backends:
 
-**Status indicator** (top-left of the soft keyboard top row):
+| Config | Transport | Transcription | Good for |
+|---|---|---|---|
+| `voice_api_url` **set** | HTTP POST of the WAV to your own STT server | whatever answers `{"text": "..."}` | self-hosted / LAN ASR (e.g. MiMo ASR), no cloud key |
+| `voice_api_url` empty (default) | second libssh2 channel on the existing SSH session → `dssh-whisper-shim` | OpenRouter Whisper Large V3 Turbo (cloud) | 99% of users — no new ports, no firewall changes |
+| same, after `dssh-whisper switch local` | SSH shim | local whisper.cpp on your server | offline / privacy |
+
+**Status indicator** (top-left slot of the keyboard status row):
+
 - 🔴 **REC** (red, pulsing) — recording in progress
-- ⠋⠙⠹⠸ (cyan, spinning) — uploading + transcribing
-- **ERR** (red, 2 s) — request failed; press START again to retry
+- ⠋⠙⠹⠸ (cyan spinner) — uploading + transcribing
+- red error text, ~6 s — the **concrete failure reason** (e.g.
+  `http timeout`, `open ctx 0x...`, `mic init`); press START to retry
 
-### HTTP API track (v1.2, self-hosted transcription server)
+### HTTP STT endpoint (self-hosted server)
 
 Instead of the SSH shim, DSSH can POST the START recording directly to
 any HTTP speech-to-text endpoint.  The request body is a 16 kHz PCM16
@@ -350,44 +394,46 @@ voice_api_url = http://192.0.2.10:29016/api/stt
 
 > **Use http://, not https://**: the 3DS system HTTP stack maxes out at
 > TLS 1.0 (old models / firmware) while modern nginx only accepts
-> TLS 1.2+, so an https endpoint fails the handshake on-device (ERR
-> badge, request never reaches the server).
+> TLS 1.2+, so an https endpoint fails the handshake on-device (error
+> badge, request never reaches the server).  Self-signed certificates
+> would be accepted (`SSLCOPT_DisableVerify`), but that never comes
+> into play if the handshake itself fails — so in practice: plain http.
 
 - Transcribed text is typed into the terminal with the same typewriter
-  effect — effectively "voice into the input box"
-- Self-signed https certificates are accepted on the 3DS side
-  (`SSLCOPT_DisableVerify`); http works too.  The upload runs on a
-  worker thread so the UI never stalls
-- **L+START AI ask does not use this track** — it still needs the SSH
-  shim (only the shim knows DeepSeek)
+  effect as the shim track
+- The upload runs on a worker thread so the UI never stalls
 - Takes effect immediately after SETTINGS SAVE; the debug page shows
-  `VOICE: HTTP API / SSH shim`
+  the active backend (`VOICE: HTTP API / SSH shim`)
 - Bake a LAN endpoint in as the compiled default (kept out of the
   repo): `make DSSH_VOICE_API_DEFAULT=http://server:29016/api/stt`
 - Reference server: mimo-voice-hub's `/api/stt` (Xiaomi MiMo ASR), with
   a browser quick page at `/stt` that drives the same endpoint
+- **L+START AI ask does not use this track** — it always goes through
+  the SSH shim (only the shim knows DeepSeek)
 
-### Recommended install — API track (SSH shim)
+### Cloud track (default) — OpenRouter Whisper via the SSH shim
 
-The voice features need **two API keys** on the server.  Both
-together cost a few cents per month for personal use:
+The classic path: the recording rides a **second libssh2 channel** on
+the same SSH session (no new ports, no new auth, no firewall changes)
+to a small server-side shim, which calls OpenRouter's Whisper Large V3
+Turbo (`$0.04` per audio-hour — pennies a month for personal use).
+
+The voice features need **two API keys** on the server:
 
 | Key | Where to get it | What it powers | Required? |
 |---|---|---|---|
 | **OpenRouter** | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) | Whisper Large V3 Turbo (speech → text) | **Required** for voice IME (START) and AI ask (L+START) |
 | **DeepSeek** | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) | DeepSeek-Chat (AI question answering) | Optional — only needed for L+START AI ask; voice IME works without it |
 
-Pricing: OpenRouter Whisper Turbo is `$0.04 / audio-hour` (~a few
-cents per month for an individual); DeepSeek-Chat is roughly
-`$0.0001 per question`.  Both providers give a small free credit on
-sign-up, more than enough to test.
+Both together cost a few cents per month; both providers give a small
+free credit on sign-up.
 
 #### One-command install
 
 SSH into your server, then:
 
 ```bash
-git clone https://github.com/Fishason/DSSH.git ~/dssh-repo
+git clone https://github.com/summerliuguang/3DSSH.git ~/dssh-repo
 bash ~/dssh-repo/tools/install_whisper_api.sh
 ```
 
@@ -470,7 +516,42 @@ chmod 0600 ~/.config/dssh-whisper/api-key
 | Server CPU load | negligible |
 | Internet | required (HTTPS to openrouter.ai + api.deepseek.com) |
 
-That's enough for 99% of users — install it, press START, done.
+### Local track (self-hosted whisper.cpp, ⚠️ not recommended)
+
+> ⚠️ **Heads-up**: the self-hosted track loads the `whisper-small`
+> model (~1 GB resident) and runs CPU inference for every recording.
+> On a 2-vCPU AWS t3.medium with VS Code Remote, claude-code, tmux, and
+> chrome-devtools-mcp running, transcribing 4 seconds of audio took
+> **~40 seconds** — vs. **~1.5 seconds** through OpenRouter at the same
+> moment.  The cost difference is so small ($0.04 per *audio* hour ≈
+> pennies/month for personal use) that we strongly recommend the cloud
+> path unless you have a hard reason to keep audio on-prem.
+>
+> If you do go local, plan on:
+>
+> - **4+ idle vCPU cores** at 3+ GHz — anything less and the 3DS UX
+>   spinner becomes painful.
+> - **2+ GB free RAM** for the small.zh model + buffers.
+> - **No competing CPU consumers** during transcription windows.
+> - **~600 MB disk** for the model + venv.
+
+If you genuinely want the offline path, the same `dssh-whisper` CLI
+manages both tracks side-by-side — install the dual variant and flip
+on demand:
+
+```bash
+git clone https://github.com/summerliuguang/3DSSH.git ~/dssh-repo
+bash ~/dssh-repo/tools/install_whisper_dual.sh
+```
+
+The dual install still defaults to `track=api`; flip to local only when
+needed:
+
+```bash
+dssh-whisper switch local   # next START press → self-hosted whisper.cpp
+dssh-whisper switch api     # next START press → OpenRouter (default)
+dssh-whisper switch         # no arg = toggle
+```
 
 ### `dssh-whisper` CLI
 
@@ -505,7 +586,7 @@ Conversation history caps at 5 turns; if you keep pressing A past
 that, the oldest turn drops off (FIFO).
 
 The model is `deepseek-chat` (DeepSeek direct API, not via
-OpenRouter) — picked for its sub-second latency and very low pricing
+OpenRouter) — picked for its fast responses and very low pricing
 (~$0.0001 per question for personal use).  Answers are 6-15 sentences
 typically; long answers wrap inside the modal and overflow truncates
 with a trailing `...`.
@@ -536,8 +617,9 @@ key later](#rotating-a-key-later) above to change it.
 
 ### Notes
 
-- 3DS firmware caps recording at ~32 s per press (the 1 MB mic buffer
-  fills at 16 kHz × 16-bit).  Tap **START** earlier to commit any time.
+- A recording caps at ~30 s per START press (1 MB mic buffer at
+  16 kHz × 16-bit ≈ 32 s; a software timer stops just before).  Tap
+  **START** earlier to commit any time.
 - Use **HOME** (not START) to exit DSSH — START is dedicated to voice.
 - `~/.config/dssh-whisper/` is on `.gitignore` already; rotating the
   API key is one `echo > api-key` away.
@@ -545,43 +627,6 @@ key later](#rotating-a-key-later) above to change it.
   exec channel.  The shim reads the active track and dispatches —
   switching tracks doesn't require restarting the 3DS or the SSH
   session.
-
-### Advanced — Dual track (self-hosted, ⚠️ not recommended)
-
-> ⚠️ **Heads-up**: the self-hosted track loads the `whisper-small`
-> model (~1 GB resident) and runs CPU inference for every recording.
-> On a 2-vCPU AWS t3.medium with VS Code Remote, claude-code, tmux, and
-> chrome-devtools-mcp running, transcribing 4 seconds of audio took
-> **~40 seconds** — vs. **~1.5 seconds** through OpenRouter at the same
-> moment.  The cost difference is so small ($0.04 per *audio* hour ≈
-> pennies/month for personal use) that we strongly recommend the cloud
-> path unless you have a hard reason to keep audio on-prem.
->
-> If you do go local, plan on:
->
-> - **4+ idle vCPU cores** at 3+ GHz — anything less and the 3DS UX
->   spinner becomes painful.
-> - **2+ GB free RAM** for the small.zh model + buffers.
-> - **No competing CPU consumers** during transcription windows.
-> - **~600 MB disk** for the model + venv.
-
-If you genuinely want the offline path, the same `dssh-whisper` CLI
-manages both tracks side-by-side — install the dual variant and flip
-on demand:
-
-```bash
-git clone https://github.com/Fishason/DSSH.git ~/dssh-repo
-bash ~/dssh-repo/tools/install_whisper_dual.sh
-```
-
-The dual install still defaults to `track=api`; flip to local only when
-needed:
-
-```bash
-dssh-whisper switch local   # next START press → self-hosted whisper.cpp
-dssh-whisper switch api     # next START press → OpenRouter (default)
-dssh-whisper switch         # no arg = toggle
-```
 
 ---
 
@@ -650,7 +695,7 @@ of silently starting a multi-second handshake — press **SELECT** to
 dial.  The WIN label shows the active window (`2/3`); it renders dimmed
 with a single configured server.
 
-### Status bar (top 30 px)
+### Status bar (top 34 px)
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -702,12 +747,12 @@ Page or cursor over to your target, then commit with A.
 
 ### Prefix fallback
 
-Typed an extra letter past a valid prefix?  The engine automatically
+Typed an extra letter past a valid pinyin?  The engine automatically
 matches the longest valid prefix and shows the surplus letters in red:
 
 ```
-buffer:  niha[oz]    ← niha in green + oz in red
-candidates:           still showing what nihao would produce
+buffer:  nihao[z]    ← nihao in green + z in red
+candidates:          still showing what nihao would produce
 ```
 
 Press B to chew the red tail back to a clean prefix.
@@ -740,7 +785,9 @@ What it shows:
 
 - Title + exit hint.
 - **recv hex**: the last 32 bytes received from SSH — for diagnosing
-  ANSI / SCS / mouse-protocol issues at the byte level.
+  ANSI / SCS / mouse-protocol issues at the byte level; HTTP-voice
+  error response bodies also land here.
+- **Voice backend line**: `VOICE: HTTP API` or `VOICE: SSH shim`.
 - **Physical key cheat sheet**: a condensed version of the bindings
   table above.
 - **MASCOT: ON/OFF** toggle button.  Default is ON.
@@ -754,7 +801,7 @@ What it shows:
 - Linux x86\_64 (tested on Ubuntu 22.04; other distros need the obvious
   package-name adjustments).
 - [devkitPro / devkitARM](https://devkitpro.org/wiki/Getting_Started)
-  release 65+, GCC 14.2.0.
+  release 65+ (built with GCC 14.2 and 16.1).
 - Python 3.10+ with Pillow (for font + dictionary generators).
 
 ### Steps
@@ -766,8 +813,8 @@ bash install-devkitpro-pacman
 sudo dkp-pacman -S 3ds-dev 3ds-mbedtls 3ds-libpng 3ds-zlib
 
 # 2. Clone recursively so libts3ds and its private lwIP are checked out
-git clone --recurse-submodules https://github.com/Fishason/DSSH.git
-cd DSSH
+git clone --recurse-submodules https://github.com/summerliuguang/3DSSH.git
+cd 3DSSH
 
 # Existing non-recursive clone only:
 git submodule update --init --recursive
@@ -803,38 +850,46 @@ The build command itself is unchanged: `make` first builds the pinned
 the Makefile prints the initialization command instead of failing later with a
 missing directory or header.
 
-### Test the IME engine on the host (no 3DS needed)
+### Host-side tests (no 3DS needed)
+
+The top-level Makefile requires `DEVKITARM` even for test targets, so
+either set it and use make, or call the test scripts directly — they
+are pure host code:
 
 ```bash
-make test-ime
+make test-ime test-config test-terminal test-voice-api
+# or equivalently, without DEVKITARM:
+bash tools/test_ime.sh         # IME engine smoke tests
+bash tools/test_config.sh      # config parse + write-back round-trip
+bash tools/test_terminal.sh    # terminal protocol (scrolling, fish cursor)
+bash tools/test_voice_api.sh   # WAV framing for the HTTP voice transport
 ```
-
-Compiles `tools/test_ime.c` linked against `source/ime_pinyin.c` and
-runs nine smoke-test queries (`ni → 你`, `nihao → 你好`, `nh → 你好`,
-etc.).
 
 ---
 
 ## Project layout
 
 ```
-DSSH/
-├── 69633.PNG                  # Source icon (162×102)
-├── icon.png                   # 48×48 icon for .3dsx / SMDH (derived)
-├── app.rsf                    # makerom CIA spec
-├── Makefile                   # Top-level build (make / make cia / make test-ime)
+3DSSH/
+├── icon.png                   # 48×48 icon for .3dsx / SMDH
+├── app.rsf                    # makerom CIA spec (DSSH+ UniqueId 0xFF55D)
+├── Makefile                   # make / make cia / make test-*
 ├── build-libssh2.sh           # libssh2 + mbedTLS ARM cross-compile
 ├── libts3ds/                  # Pinned native Tailscale client submodule
 ├── source/
 │   ├── main.c                 # Main loop, SSH receive, UTF-8 reassembly
-│   ├── ssh_client.{c,h}       # libssh2 wrapper
-│   ├── config.{c,h}           # SD-card config.ini parser
+│   ├── ssh_client.{c,h}       # libssh2 wrapper (+ keychain, Tailscale wiring)
+│   ├── config.{c,h}           # SD-card config.ini parser (multi-server)
 │   ├── terminal.{c,h}         # ANSI/VT100 parser (forked from skmtrd)
 │   ├── renderer.{c,h}         # citro2d rendering (terminal, text, CJK)
 │   ├── keyboard.{c,h}         # Physical buttons + IME routing
-│   ├── softkb.{c,h}           # Soft keyboard + candidate strip + settings page + debug page
+│   ├── softkb.{c,h}           # Soft keyboard + candidate strip + settings + debug page
 │   ├── ime_pinyin.{c,h}       # Pinyin engine
-│   ├── voice_api.{c,h}        # HTTP voice-API transport (WAV framing + httpc)
+│   ├── voice.{c,h}            # Voice pipeline: mic capture + SSH-shim transport
+│   ├── voice_api.{c,h}        # HTTP voice transport (WAV framing + httpc)
+│   ├── ai_modal.{c,h}         # L+START AI-ask modal + markdown rendering
+│   ├── audio.{c,h}            # Soft-keyboard click sound (DSP, fails soft)
+│   ├── keychain_protocol.h    # macOS keychain unlock bootstrap protocol
 │   ├── mascot.{c,h}           # Crab mascot
 │   ├── font_atlas.{c,h}       # Codepoint → glyph index
 │   └── font_data.c            # Font bitmaps (gen_font.py output)
@@ -843,7 +898,14 @@ DSSH/
 │   ├── gen_font.py            # Font atlas generator
 │   ├── fetch_pinyin_dict.sh   # Download rime-ice
 │   ├── gen_pinyin_dict.py     # Dictionary → binary
-│   ├── test_ime.{c,sh}        # Host-side IME smoke test
+│   ├── test_ime.{c,sh}        # Host tests: IME engine
+│   ├── test_config.{c,sh}     # Host tests: config parse/write-back
+│   ├── test_terminal.{c,sh}   # Host tests: terminal protocol
+│   ├── test_voice_api.{c,sh}  # Host tests: WAV framing
+│   ├── install_whisper_api.sh # Server: cloud voice install (shim + CLI)
+│   ├── install_whisper_dual.sh# Server: dual-track install (cloud + local)
+│   ├── whisper_shim.py        # Server: SSH-exec shim (both tracks)
+│   ├── whisper_daemon.py      # Server: local whisper.cpp daemon
 │   ├── gen_cia_assets.py      # Icon / banner derivation
 │   └── install_cia_tools.sh   # bannertool + makerom installer
 ├── romfs/                     # gitignored — packs pinyin_dict.bin
@@ -857,11 +919,11 @@ DSSH/
 
 ```
 SSH server (somewhere on the internet)
-     ▲ libssh2 over mbedTLS-RSA-4096
+     ▲ libssh2 over mbedTLS-RSA-4096 (or libts3ds tailnet)
      │
 ┌────┴──────────────────────────────────────────────────┐
 │  main.c poll loop @ 60 fps                            │
-│   ├─ ssh_read → softkb_record_recv → utf8 reassemble  │
+│   ├─ ssh_read (all windows) → utf8 reassemble         │
 │   │                ↓                                  │
 │   │   terminal_write_n → ANSI parser → cell grid      │
 │   ├─ hidScanInput → keyboard_handle_input             │
@@ -896,6 +958,8 @@ the full progression.
 - **[skmtrd/3dssh](https://github.com/skmtrd/3dssh)** — the original
   Japanese-localized 3DS SSH client; DSSH reuses its ANSI/VT100 parser,
   UTF-8 reassembly, and citro2d framing.
+- **[Fishason/DSSH](https://github.com/Fishason/DSSH)** — the direct
+  upstream: pinyin IME, soft keyboard, and cloud voice input.
 - **[rime-ice](https://github.com/iDvel/rime-ice)** — pinyin dictionary
   source (pinned at commit `3f57a6f6`).
 - **[Zpix Pixel Font](https://github.com/SolidZORO/zpix-pixel-font)** —

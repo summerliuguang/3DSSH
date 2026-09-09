@@ -27,12 +27,13 @@ server1_passphrase =
 active_server = 1
 
 # ── Voice input ──
-# HTTP voice-transcription API (mimo-voice-hub /api/stt or any endpoint
-# accepting a WAV POST and answering {"text": "..."}).  When set, START
-# recordings upload here instead of the SSH shim.  Leave empty to use
-# the classic dssh-whisper-shim over the SSH session.  The on-device
-# default can also be baked in at build time:
-#   make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
+# HTTP voice-transcription API (any endpoint accepting a WAV POST and
+# answering {"text": "..."}).  When set, START recordings upload here
+# instead of the SSH shim.  Leave empty to use the classic
+# dssh-whisper-shim over the SSH session.  Use plain http:// — the 3DS
+# system HTTP stack maxes out at TLS 1.0, which modern https servers
+# refuse.  The on-device default can also be baked in at build time:
+#   make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt
 voice_api_url =
 
 # ── Global (legacy) options ──
