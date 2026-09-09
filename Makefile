@@ -54,6 +54,11 @@ CFLAGS	+=	-DDSSH_TAILSCALE_VERBOSE=$(DSSH_TAILSCALE_VERBOSE)
 DSSH_VOICE_API_DEFAULT ?= ""
 CFLAGS	+=	-DDSSH_VOICE_API_DEFAULT=\"$(DSSH_VOICE_API_DEFAULT)\"
 
+# Terminal offscreen render cache (1 = default; 0 = direct draw every
+# frame, the pre-cache behavior -- use if the cached path misbehaves).
+DSSH_TERMINAL_CACHE ?= 1
+CFLAGS	+=	-DDSSH_TERMINAL_CACHE=$(DSSH_TERMINAL_CACHE)
+
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
 ASFLAGS	:=	-g $(ARCH)

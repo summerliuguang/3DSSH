@@ -28,6 +28,7 @@
 
 #include "ssh_client.h"
 #include "config.h"
+#include "audio.h"
 #include "keychain_protocol.h"
 #include "terminal.h"
 #include "renderer.h"
@@ -216,17 +217,36 @@ static void win_label(char *dst, size_t cap, int slot, int total) {
 
 static void feed_terminal(terminal_t *term, char *frag, int *frag_len,
                           const char *raw, int raw_len) {
+    /* Fast path: no pending fragment — scan raw's tail in place and
+     * hand the valid prefix straight to the parser.  The staging copy
+     * below is only needed when a previous packet's split UTF-8 tail
+     * must be rejoined. */
+    if (*frag_len == 0) {
+        int valid_end = raw_len;
+        for (int j = raw_len - 1; j >= raw_len - 3 && j >= 0; j--) {
+            unsigned char b = (unsigned char)raw[j];
+            if (b >= 0xc0) {
+                int seq_len = (b < 0xe0) ? 2 : (b < 0xf0) ? 3 : 4;
+                if (raw_len - j < seq_len) {
+                    *frag_len = raw_len - j;
+                    memcpy(frag, raw + j, (size_t)*frag_len);
+                    valid_end = j;
+                }
+                break;
+            } else if (b < 0x80) {
+                break;
+            }
+        }
+        terminal_write_n(term, raw, valid_end);
+        return;
+    }
+
     char buf[4 + READ_BUFSZ];
     int total;
-    if (*frag_len > 0) {
-        memcpy(buf, frag, (size_t)*frag_len);
-        memcpy(buf + *frag_len, raw, (size_t)raw_len);
-        total = *frag_len + raw_len;
-        *frag_len = 0;
-    } else {
-        memcpy(buf, raw, (size_t)raw_len);
-        total = raw_len;
-    }
+    memcpy(buf, frag, (size_t)*frag_len);
+    memcpy(buf + *frag_len, raw, (size_t)raw_len);
+    total = *frag_len + raw_len;
+    *frag_len = 0;
     int valid_end = total;
     for (int j = total - 1; j >= total - 3 && j >= 0; j--) {
         unsigned char b = (unsigned char)buf[j];
@@ -310,6 +330,7 @@ static int wait_for_remote_text_any(ssh_client_t *ssh, terminal_t *term,
     u64 deadline = osGetTime() + (u64)timeout_ms;
 
     while (osGetTime() < deadline) {
+        if (!aptMainLoop()) return -1;
         /* The keychain bootstrap runs before the main loop, so the UI is
          * frozen while we wait (up to 60s if the remote auto-starts tmux,
          * which swallows the OSC readiness marker).  Give the user a way
@@ -511,11 +532,35 @@ static void clear_secret(char *s, size_t len) {
     while (len-- > 0) *p++ = 0;
 }
 
+/* Bottom row of the bottom screen: clock on the left, mascot on the
+ * right.  Suppressed while the debug overlay is up (it draws its own
+ * full-screen background).  Shared by the main render path and the
+ * blocking-connect frames so the clock/mascot never disappear.  The
+ * clock text changes at most once per minute — re-render it once per
+ * second instead of every frame. */
+static void draw_bottom_row(softkb_t *kb, mascot_t *mc) {
+    if (softkb_in_debug(kb)) return;
+    static time_t cached_sec = 0;
+    static char   cached_buf[24] = "";
+    time_t now = time(NULL);
+    if (now != cached_sec) {
+        struct tm lt;
+        localtime_r(&now, &lt);
+        snprintf(cached_buf, sizeof(cached_buf), "%02d-%02d %02d:%02d",
+                 lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+        cached_sec = now;
+    }
+    /* Vertically center 12-px text in the 26-px bottom row: y = 221. */
+    renderer_draw_text_px(2, 221, cached_buf, COLOR_DIM);
+    if (softkb_mascot_enabled(kb)) mascot_draw(mc);
+}
+
 static void render_connecting_frame(C3D_RenderTarget *top,
                                     C3D_RenderTarget *bot,
                                     renderer_t *renderer, terminal_t *term,
                                     softkb_t *keyboard,
-                                    keyboard_t *physical_keyboard) {
+                                    keyboard_t *physical_keyboard,
+                                    mascot_t *mascot) {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
     C2D_SceneBegin(top);
@@ -523,6 +568,7 @@ static void render_connecting_frame(C3D_RenderTarget *top,
     C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
     C2D_SceneBegin(bot);
     softkb_draw(keyboard, renderer, physical_keyboard);
+    draw_bottom_row(keyboard, mascot);
     C3D_FrameEnd(0);
 }
 
@@ -538,6 +584,7 @@ static ssh_client_t *keychain_bootstrap(ssh_window_t *win,
                                         softkb_t *kb, keyboard_t *kbd,
                                         C3D_RenderTarget *top,
                                         C3D_RenderTarget *bot,
+                                        mascot_t *mc,
                                         char *status_buf, int status_sz,
                                         uint32_t *status_color,
                                         char *err, int err_sz) {
@@ -548,7 +595,7 @@ static ssh_client_t *keychain_bootstrap(ssh_window_t *win,
      * then reset again so fish CPR uses remote coordinates. */
     terminal_write(win->term,
                    "\x1b[36mUnlocking macOS keychain...\x1b[0m\r\n");
-    render_connecting_frame(top, bot, r, win->term, kb, kbd);
+    render_connecting_frame(top, bot, r, win->term, kb, kbd, mc);
     terminal_reset(win->term);
 
     keychain_report_t report = { -1, -1 };
@@ -674,39 +721,63 @@ static ssh_client_t *attempt_reconnect(const ssh_config_t *cfg, int slot,
     mascot_set_reconnecting(mc, 1);
     /* The blocking handshake below stalls the loop — flush one frame
      * right now so the banner is actually on screen during the wait. */
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-    C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
-    C2D_SceneBegin(top);
-    renderer_draw_terminal(r, win->term);
-    C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
-    C2D_SceneBegin(bot);
-    softkb_draw(kb, r, kbd);
-    /* Bottom row: clock + window/mascot buttons + mascot, mirroring the
-     * main render path so the reconnect frame isn't missing anything. */
-    if (!softkb_in_debug(kb)) {
-        char clock_buf[24];
-        time_t now = time(NULL);
-        struct tm lt;
-        localtime_r(&now, &lt);
-        snprintf(clock_buf, sizeof(clock_buf),
-                 "%02d-%02d %02d:%02d",
-                 lt.tm_mon + 1, lt.tm_mday,
-                 lt.tm_hour, lt.tm_min);
-        renderer_draw_text_px(2, 221, clock_buf, COLOR_DIM);
-        if (softkb_mascot_enabled(kb)) mascot_draw(mc);
-    }
-    C3D_FrameEnd(0);
+    render_connecting_frame(top, bot, r, win->term, kb, kbd, mc);
 
     ssh_client_t *ssh = reconnect_ssh(cfg, slot, tailscale, win->term,
                                       status_buf, status_sz,
                                       err, err_sz);
-    /* Reconnected to a macOS host: its login keychain locked again with
-     * the old session — unlock it again so Claude Code keeps finding
-     * its credentials. */
-    ssh = keychain_bootstrap(win, cfg, r, kb, kbd, top, bot,
+    if (!ssh) {
+        mascot_set_reconnecting(mc, 0);
+        return NULL;
+    }
+    /* keychain_bootstrap operates on win->ssh — register the fresh
+     * session BEFORE the bootstrap.  (Forgetting this made every
+     * reconnect fail-return: bootstrap saw win->ssh == NULL and
+     * returned it verbatim, leaking the just-dialed session.) */
+    win->ssh = ssh;
+    ssh = keychain_bootstrap(win, cfg, r, kb, kbd, top, bot, mc,
                              status_buf, status_sz, status_color,
                              err, err_sz);
     mascot_set_reconnecting(mc, 0);
+    return ssh;
+}
+
+/* Shared tail of the two reconnect flows (SELECT key on a dead active
+ * window, SETTINGS-page RECONNECT): dial + keychain bootstrap, then
+ * sync the window and the main-loop state in one place.  Returns the
+ * new session or NULL.
+ *
+ * NOTE: both callers used to duplicate this block, and the SELECT copy
+ * forgot to clear ssh_dead on success — the alert stayed raised and
+ * the next SELECT re-dialed a healthy session.  Centralized so both
+ * paths behave identically. */
+static ssh_client_t *reconnect_and_sync(const ssh_config_t *cfg, int slot,
+                                        ts3ds *tailscale, ssh_window_t *win,
+                                        renderer_t *r, softkb_t *kb,
+                                        keyboard_t *kbd, mascot_t *mc,
+                                        C3D_RenderTarget *top,
+                                        C3D_RenderTarget *bot,
+                                        char *status_buf, int status_sz,
+                                        uint32_t *status_color,
+                                        char *err, int err_sz,
+                                        int *ssh_dead, int *stall_alert) {
+    ssh_client_t *ssh = attempt_reconnect(cfg, slot, tailscale, win, r, kb,
+                                          kbd, mc, top, bot, status_buf,
+                                          status_sz, status_color, err,
+                                          err_sz);
+    if (ssh) {
+        win->dead = 0;
+        win->ssh  = ssh;
+        win->last_rx = time(NULL);
+        *ssh_dead    = 0;
+        *stall_alert = 0;
+        mascot_celebrate(mc);
+        g_last_tx_at = time(NULL);
+    } else {
+        mascot_sadden(mc);
+        terminal_write(win->term,
+            "\x1b[31mReconnect failed; press SELECT to retry.\x1b[0m\r\n");
+    }
     return ssh;
 }
 
@@ -725,11 +796,14 @@ int main(int argc, char *argv[]) {
     static tailscale_debug_log tailscale_debug;
     tailscale_debug_init(&tailscale_debug);
 
-    /* ── Graphics init (audio disabled — see audio.{c,h} kept for future) ── */
+    /* ── Graphics init ── */
     gfxInitDefault();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(32768);
     C2D_Prepare();
+    /* Soft-keyboard click sound.  Fails silently (audio_ok stays 0 and
+     * audio_play_click becomes a no-op) when DSP firmware is absent. */
+    audio_init();
     C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP,    GFX_LEFT);
     C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
@@ -842,7 +916,7 @@ int main(int argc, char *argv[]) {
                      cfg.tailscale_state);
             terminal_write(term, line);
         }
-        render_connecting_frame(top, bot, r, term, kb, kbd);
+        render_connecting_frame(top, bot, r, term, kb, kbd, mc);
         tailscale = ts3ds_new(&tailscale_config);
         int tailscale_result = tailscale ? ts3ds_up(tailscale)
                                          : TS3DS_ERR_ARGUMENT;
@@ -881,7 +955,7 @@ int main(int argc, char *argv[]) {
     /* Pump one frame so the user sees the loading banner during the
      * (synchronous, ~5s) dict read.  The bottom screen still has the
      * keyboard rendered — the badge and mascot work normally. */
-    render_connecting_frame(top, bot, r, term, kb, kbd);
+    render_connecting_frame(top, bot, r, term, kb, kbd, mc);
 
     /* Load the pinyin dict (~9 MB).  Failure here is non-fatal — we
      * just leave ime NULL and softkb degrades CN mode to passthrough. */
@@ -908,7 +982,7 @@ int main(int argc, char *argv[]) {
 
     /* Pump again so the user sees the loaded/connecting banners before
      * the SSH handshake blocks the main loop. */
-    render_connecting_frame(top, bot, r, term, kb, kbd);
+    render_connecting_frame(top, bot, r, term, kb, kbd, mc);
 
     ssh = reconnect_ssh(&cfg, 0, tailscale, term, status_buf,
                         sizeof(status_buf), err, sizeof(err));
@@ -920,7 +994,7 @@ int main(int argc, char *argv[]) {
     tailscale_debug_flush(&tailscale_debug, term);
     status_color = ssh ? COLOR_OK : COLOR_ERR;
 
-    ssh = keychain_bootstrap(&g_win[0], &cfg, r, kb, kbd, top, bot,
+    ssh = keychain_bootstrap(&g_win[0], &cfg, r, kb, kbd, top, bot, mc,
                              status_buf, sizeof(status_buf), &status_color,
                              err, sizeof(err));
 
@@ -1118,23 +1192,12 @@ idle_loop:
             int select_consumed = 0;
             if (ssh_dead && !modal_open && !set_edit && (down & KEY_SELECT)) {
                 select_consumed = 1;
-                ssh = attempt_reconnect(&cfg, g_active, tailscale,
-                                        &g_win[g_active],
-                                        r, kb, kbd, mc, top, bot,
-                                        status_buf, sizeof(status_buf),
-                                        &status_color, err, sizeof(err));
-                if (ssh) {
-                    g_win[g_active].dead = 0;
-                    g_win[g_active].ssh  = ssh;
-                    g_win[g_active].last_rx = time(NULL);
-                    stall_alert = 0;
-                    mascot_celebrate(mc);
-                    g_last_tx_at = time(NULL);
-                } else {
-                    mascot_sadden(mc);
-                    terminal_write(term,
-                        "\x1b[31mReconnect failed; press SELECT to retry.\x1b[0m\r\n");
-                }
+                ssh = reconnect_and_sync(&cfg, g_active, tailscale,
+                                         &g_win[g_active],
+                                         r, kb, kbd, mc, top, bot,
+                                         status_buf, sizeof(status_buf),
+                                         &status_color, err, sizeof(err),
+                                         &ssh_dead, &stall_alert);
             }
 
             /* ── Physical keys (Esc / Enter / BS / D-pad / R / scroll) ──
@@ -1234,25 +1297,13 @@ idle_loop:
                     }
                     g_win[g_active].ssh  = NULL;
                     ssh_dead = 1;
-                    ssh = attempt_reconnect(&cfg, g_active, tailscale,
-                                            &g_win[g_active],
-                                            r, kb, kbd, mc, top, bot,
-                                            status_buf, sizeof(status_buf),
-                                            &status_color, err, sizeof(err));
-                    if (ssh) {
-                        g_win[g_active].ssh  = ssh;
-                        g_win[g_active].dead = 0;
-                        g_win[g_active].last_rx = time(NULL);
-                        ssh_dead    = 0;
-                        stall_alert = 0;
-                        mascot_celebrate(mc);
-                        g_last_tx_at = time(NULL);
-                    } else {
-                        mascot_sadden(mc);
-                        terminal_write(term,
-                            "\x1b[31mReconnect failed; press SELECT to "
-                            "retry.\x1b[0m\r\n");
-                    }
+                    ssh = reconnect_and_sync(&cfg, g_active, tailscale,
+                                             &g_win[g_active],
+                                             r, kb, kbd, mc, top, bot,
+                                             status_buf, sizeof(status_buf),
+                                             &status_color, err,
+                                             sizeof(err),
+                                             &ssh_dead, &stall_alert);
                 } else if (act == SOFTKB_ACT_WIN_NEXT) {
                     /* Cycle to the next configured slot that has a host.
                      * Switching is instant: the target terminal is created
@@ -1316,23 +1367,10 @@ idle_loop:
             C2D_SceneBegin(bot);
             softkb_draw(kb, r, kbd);
 
-            /* Bottom row: clock on the left, mascot on the right.
-             * Suppressed entirely when the debug overlay is up — the
-             * debug page draws its own full-screen background. */
-            if (!softkb_in_debug(kb)) {
-                char clock_buf[24];
-                time_t now = time(NULL);
-                struct tm lt;
-                localtime_r(&now, &lt);
-                snprintf(clock_buf, sizeof(clock_buf),
-                         "%02d-%02d %02d:%02d",
-                         lt.tm_mon + 1, lt.tm_mday,
-                         lt.tm_hour, lt.tm_min);
-                /* Vertically center 12-px text in the 26-px bottom row:
-                 * y = 214 + (26-12)/2 = 221. */
-                renderer_draw_text_px(2, 221, clock_buf, COLOR_DIM);
-                if (softkb_mascot_enabled(kb)) mascot_draw(mc);
-            }
+            /* Bottom row: clock + mascot (shared helper; no-ops on
+             * the debug page, which draws its own full-screen
+             * background). */
+            draw_bottom_row(kb, mc);
 
             /* M12 — modal lays over softkb + clock + mascot.  Drawn
              * last so its dimming overlay correctly covers everything
@@ -1393,6 +1431,7 @@ cleanup:
     if (kbd)  keyboard_free(kbd);
     if (r)    renderer_free(r);
     if (romfs_ok) romfsExit();
+    audio_exit();
     C2D_Fini();
     C3D_Fini();
     gfxExit();

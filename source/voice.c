@@ -165,8 +165,7 @@ static void enter_typing(voice_t *v) {
     int delay;
     if      (n < 20)  delay = 5;
     else if (n < 40)  delay = 3;
-    else if (n < 80)  delay = 2;
-    else if (n < 160) delay = 2;
+    else if (n < 160) delay = 2;   /* 40..79 and 80..159 were both 2 */
     else              delay = 1;
     v->type_delay = delay;
 }
@@ -571,26 +570,16 @@ static void finish_ai_transcribe(voice_t *v) {
      * parsing produced an empty payload.  Lets the user see what the
      * 3DS actually received vs. what the server logged it sent. */
     if (v->ai_answer[0] == 0) {
-        const char prefix[] = "[parse-fail dump rc q=";
-        int o = 0;
+        /* Raw reply bytes, truncated to fit the buffer. */
+        snprintf(v->ai_answer, sizeof(v->ai_answer),
+                 "[parse-fail dump rc q=%d a=%d len=%d]",
+                 q_rc < 0 ? 1 : 0, a_rc < 0 ? 1 : 0, v->reply_len);
+        int o = (int)strlen(v->ai_answer);
         int avail = (int)sizeof(v->ai_answer) - 1;
-        int pl = (int)sizeof(prefix) - 1;
-        if (o + pl < avail) { memcpy(v->ai_answer + o, prefix, pl); o += pl; }
-        v->ai_answer[o++] = (char)('0' + (q_rc < 0 ? 1 : 0));
-        if (o + 4 < avail) { memcpy(v->ai_answer + o, " a=", 3); o += 3; }
-        v->ai_answer[o++] = (char)('0' + (a_rc < 0 ? 1 : 0));
-        if (o + 8 < avail) { memcpy(v->ai_answer + o, " len=", 5); o += 5; }
-        /* Print reply_len as decimal. */
-        char num[12];
-        int nl = snprintf(num, sizeof(num), "%d", v->reply_len);
-        if (o + nl < avail) { memcpy(v->ai_answer + o, num, (size_t)nl); o += nl; }
-        if (o + 3 < avail) { memcpy(v->ai_answer + o, "]\n", 2); o += 2; }
-        /* Then the raw reply_buf bytes, truncated to fit the buffer. */
-        int n = v->reply_len;
-        if (n > avail - o) n = avail - o;
-        memcpy(v->ai_answer + o, v->reply_buf, (size_t)n);
-        o += n;
-        v->ai_answer[o] = 0;
+        int ncpy = v->reply_len;
+        if (ncpy > avail - o) ncpy = avail - o;
+        if (ncpy > 0) memcpy(v->ai_answer + o, v->reply_buf, (size_t)ncpy);
+        v->ai_answer[o + ncpy] = 0;
     }
 
     v->state       = VOICE_AI_SHOWING;
@@ -629,14 +618,19 @@ void voice_abort(voice_t *v) {
     enter_idle(v);
 }
 
-void voice_toggle(voice_t *v, ssh_client_t *ssh) {
+/* Shared implementation of voice_toggle()/voice_ai_toggle().  The only
+ * differences are the mode latched when starting from IDLE and the
+ * RECORDING case (plain START finalizes in the current mode; L+START
+ * promotes the in-flight recording to AI). */
+static void voice_toggle_impl(voice_t *v, ssh_client_t *ssh, int ai) {
     if (!v || !ssh) return;
     switch (v->state) {
         case VOICE_IDLE:
-            v->ai_mode = 0;
+            v->ai_mode = ai;
             start_recording(v);
             break;
         case VOICE_RECORDING:
+            if (ai) v->ai_mode = 1;
             begin_transcribe(v, ssh);
             break;
         case VOICE_TRANSCRIBING:
@@ -649,9 +643,7 @@ void voice_toggle(voice_t *v, ssh_client_t *ssh) {
             flush_typing(v, ssh);
             break;
         case VOICE_AI_SHOWING:
-            /* Plain START while modal up — let the modal stay; the
-             * caller (main.c) routes start back to us only when modal
-             * is closed.  Defensive: ignore. */
+            /* Modal up — main.c shouldn't route here; defensive ignore. */
             break;
         case VOICE_ERROR:
             enter_idle(v);
@@ -659,37 +651,12 @@ void voice_toggle(voice_t *v, ssh_client_t *ssh) {
     }
 }
 
+void voice_toggle(voice_t *v, ssh_client_t *ssh) {
+    voice_toggle_impl(v, ssh, 0);
+}
+
 void voice_ai_toggle(voice_t *v, ssh_client_t *ssh) {
-    if (!v || !ssh) return;
-    switch (v->state) {
-        case VOICE_IDLE:
-            v->ai_mode = 1;
-            start_recording(v);
-            break;
-        case VOICE_RECORDING:
-            /* Already recording — finalize and ship to AI (whatever
-             * START was originally pressed for, the user just promoted
-             * to AI by the L modifier).  Keep ai_mode set if it was
-             * already set; otherwise upgrade to AI mode now. */
-            v->ai_mode = 1;
-            begin_transcribe(v, ssh);
-            break;
-        case VOICE_TRANSCRIBING:
-            release_aux(v);
-            enter_idle(v);
-            break;
-        case VOICE_TYPING:
-            /* Non-AI reply still streaming; L+START mid-typing just
-             * flushes it and returns to idle (this cycle wasn't AI). */
-            flush_typing(v, ssh);
-            break;
-        case VOICE_AI_SHOWING:
-            /* Modal up — main.c shouldn't route here; defensive ignore. */
-            break;
-        case VOICE_ERROR:
-            enter_idle(v);
-            break;
-    }
+    voice_toggle_impl(v, ssh, 1);
 }
 
 void voice_ai_close_keep(voice_t *v) {
@@ -871,16 +838,7 @@ void voice_tick(voice_t *v, ssh_client_t *ssh) {
                     if (v->ai_mode) {
                         /* Parse JSON, transition to AI_SHOWING; release
                          * aux but keep ai_mode and history intact. */
-                        if (v->aux) {
-                            ssh_aux_close(v->aux);
-                            v->aux = NULL;
-                        }
-                        if (v->xfer_owned) {
-                            free(v->xfer_owned);
-                            v->xfer_owned = NULL;
-                        }
-                        v->xfer_buf = NULL;
-                        v->xfer_len = 0;
+                        release_aux(v);
                         finish_ai_transcribe(v);
                     } else {
                         if (v->reply_len > 0) {

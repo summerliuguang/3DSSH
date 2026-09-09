@@ -1,6 +1,7 @@
 #include "softkb.h"
 #include "renderer.h"
 #include "keyboard.h"
+#include "audio.h"
 #include <citro2d.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,8 +175,6 @@ struct softkb_t {
     softkb_page_t page;
     int           pressed_idx;     /* index of currently-touched key, -1 = none */
     int           pressed_frames;  /* visual press-down animation timer */
-    char          out_buf[16];
-    int           out_len;
 
     /* Hold-to-repeat state — independent from the visual press animation
      * because that one fades after 14 frames while a true hold may last
@@ -753,6 +752,7 @@ const char *softkb_touch(softkb_t *kb,
         }
     }
     if (!fire) return NULL;
+    audio_play_click();   /* no-op when DSP audio failed to init */
 
     /* True iff we should route this tap through the IME instead of
      * sending it raw.  CN mode + a-z key + no held modifier → IME.
@@ -804,13 +804,6 @@ const char *softkb_touch(softkb_t *kb,
 }
 
 /* ── rendering helpers ─────────────────────────────────────────────── */
-
-static u32 rgba_to_c2d_(uint32_t rgba) {
-    return C2D_Color32((rgba >> 24) & 0xff,
-                       (rgba >> 16) & 0xff,
-                       (rgba >>  8) & 0xff,
-                        rgba        & 0xff);
-}
 
 /* Press-down animation timing.  When a key is tapped, pressed_frames
  * counts up from 0; press_depth() turns that frame counter into a
@@ -869,7 +862,7 @@ static uint32_t blend_rgba(uint32_t a, uint32_t b, int t, int range) {
  * for its keyboard, and visibly more rounded than the previous 2-px
  * L-shaped chamfer. */
 static void round_corners(int x, int y, int w, int h, float z) {
-    uint32_t c = rgba_to_c2d_(COL_CHAMFER);
+    uint32_t c = rgba_to_c2d(COL_CHAMFER);
     /* TL */
     C2D_DrawRectSolid((float)x,       (float)y,       z, 3, 1, c);
     C2D_DrawRectSolid((float)x,       (float)(y + 1), z, 2, 1, c);
@@ -913,23 +906,23 @@ static void draw_key_button(int x, int y, int w, int h,
     if (depth == 0) {
         C2D_DrawRectSolid((float)(x + 1), (float)(y + h), 0.10f,
                           (float)(w - 2), 1,
-                          rgba_to_c2d_(COL_KEY_BOT_SHADOW));
+                          rgba_to_c2d(COL_KEY_BOT_SHADOW));
     }
 
     /* Border around the (possibly translated) body. */
     C2D_DrawRectSolid((float)x, (float)yd, 0.12f,
                       (float)w, (float)h,
-                      rgba_to_c2d_(COL_KEY_BORDER));
+                      rgba_to_c2d(COL_KEY_BORDER));
     /* Body fill, inset 1 px from the border. */
     C2D_DrawRectSolid((float)(x + 1), (float)(yd + 1), 0.15f,
                       (float)(w - 2), (float)(h - 2),
-                      rgba_to_c2d_(body));
+                      rgba_to_c2d(body));
     /* Top highlight only when resting (the sliver at the top of a
      * physical keycap that catches light). */
     if (depth == 0) {
         C2D_DrawRectSolid((float)(x + 1), (float)(yd + 1), 0.18f,
                           (float)(w - 2), 1,
-                          rgba_to_c2d_(COL_KEY_TOP));
+                          rgba_to_c2d(COL_KEY_TOP));
     }
     /* Corners follow the body's translated position. */
     round_corners(x, yd, w, h, 0.21f);
@@ -1029,7 +1022,7 @@ static int draw_ime_strip(softkb_t *kb,
         if (i == sel) {
             C2D_DrawRectSolid((float)(x - 2), (float)(strip_y + 2),
                               0.072f, (float)(w + 4), (float)(STATUS_H - 8),
-                              rgba_to_c2d_(COL_IME_SELECTED_BG));
+                              rgba_to_c2d(COL_IME_SELECTED_BG));
         }
         renderer_draw_text_px(x, y, cand, COL_IME_CANDIDATE_FG);
         kb->cand_box_x[n_drawn] = x - 2;
@@ -1061,14 +1054,14 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
 
     /* Status row band (full width). */
     C2D_DrawRectSolid(0, 0, 0.05f, 320, STATUS_H,
-                      rgba_to_c2d_(COL_STATUS_BG));
+                      rgba_to_c2d(COL_STATUS_BG));
 
     /* Candidate strip between the two slots. */
     int strip_x   = slot_w + 6;
     int strip_end = 320 - slot_w - 6;
     C2D_DrawRectSolid((float)strip_x, (float)slot_y, 0.06f,
                       (float)(strip_end - strip_x), (float)slot_h,
-                      rgba_to_c2d_(COL_CANDIDATE_BG));
+                      rgba_to_c2d(COL_CANDIDATE_BG));
 
     /* IME candidates over the strip (when buffer non-empty). */
     kb->cand_box_n = 0;
@@ -1090,14 +1083,14 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
     /* Always-drawn slot bg keeps the layout visually anchored. */
     C2D_DrawRectSolid(2, (float)slot_y, 0.07f,
                       (float)slot_w, (float)slot_h,
-                      rgba_to_c2d_(COL_MODE_LBL_BG));
+                      rgba_to_c2d(COL_MODE_LBL_BG));
 
     if (voice_lbl) {
         /* Voice tint over the slot. */
         if (voice_bg) {
             C2D_DrawRectSolid(2, (float)slot_y, 0.072f,
                               (float)slot_w, (float)slot_h,
-                              rgba_to_c2d_(voice_bg));
+                              rgba_to_c2d(voice_bg));
         }
         if (strlen(voice_lbl) > 3) {
             /* Surfaced error reason (e.g. "open ctx 0x…") — left-align
@@ -1112,7 +1105,7 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
         /* Highlight overlay: faint blue tint behind the active label. */
         C2D_DrawRectSolid(2, (float)slot_y, 0.072f,
                           (float)slot_w, (float)slot_h,
-                          rgba_to_c2d_(COL_STATUS_HOLD_BG));
+                          rgba_to_c2d(COL_STATUS_HOLD_BG));
         int x0 = 2 + (slot_w - label_tw) / 2;
         renderer_draw_text_px(x0, label_y, status, COL_STATUS_FG_HOLD);
     }
@@ -1124,7 +1117,7 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
     int rx = 320 - slot_w - 2;
     C2D_DrawRectSolid((float)rx, (float)slot_y, 0.07f,
                       (float)slot_w, (float)slot_h,
-                      rgba_to_c2d_(COL_MODE_LBL_BG));
+                      rgba_to_c2d(COL_MODE_LBL_BG));
     int mx = rx + (slot_w - label_tw) / 2;
     renderer_draw_text_px(mx, label_y, mode_label, mode_color);
 
@@ -1137,7 +1130,7 @@ static void draw_debug_screen(softkb_t *kb, renderer_t *r,
                               const keyboard_t *kbd) {
     /* Solid background over the whole bottom screen. */
     C2D_DrawRectSolid(0, 0, 0.05f, 320, 240,
-                      rgba_to_c2d_(COL_STATUS_BG));
+                      rgba_to_c2d(COL_STATUS_BG));
 
     /* Keep the status bar so the ENG/CHN badge is still visible/tappable
      * — that's how the user gets back out. */
@@ -1184,7 +1177,7 @@ static void draw_debug_screen(softkb_t *kb, renderer_t *r,
     renderer_draw_text_px(8, kb_y + 42,
         "D-pad=arrows/IME  Space=commit cand", COL_KEY_LABEL);
     renderer_draw_text_px(8, kb_y + 56,
-        "Circle=scroll  L+Circle=right pane", COL_KEY_LABEL);
+        "Circle=center L+Circle=left pane", COL_KEY_LABEL);
 
     /* Mascot toggle button — drawn as a regular key for visual
      * consistency with the keyboard layout. */
@@ -1223,13 +1216,14 @@ static void draw_value_clipped(int x, int y, const char *val, int max_px,
     char glyph[5];
     int w = 0;
     int pos = 0;
+    int len = (int)strlen(val);   /* once — don't strlen per glyph step */
     while (val[pos]) {
         int clen = 1;
         unsigned char lead = (unsigned char)val[pos];
         if (lead >= 0xF0)      clen = 4;
         else if (lead >= 0xE0) clen = 3;
         else if (lead >= 0xC0) clen = 2;
-        if ((int)strlen(val + pos) < clen) break;   /* torn tail */
+        if (len - pos < clen) break;   /* torn tail */
         memcpy(glyph, val + pos, (size_t)clen);
         glyph[clen] = 0;
         int cw = renderer_utf8_text_width_px(glyph);
@@ -1292,7 +1286,7 @@ static void draw_keyboard_keys(softkb_t *kb) {
 static void draw_settings_screen(softkb_t *kb, renderer_t *r,
                                  const keyboard_t *kbd) {
     C2D_DrawRectSolid(0, 0, 0.05f, 320, 240,
-                      rgba_to_c2d_(COL_STATUS_BG));
+                      rgba_to_c2d(COL_STATUS_BG));
 
     /* ── Edit mode: field bar (replaces the status row) + keyboard ── */
     if (kb->set_edit >= 0) {
@@ -1303,7 +1297,7 @@ static void draw_settings_screen(softkb_t *kb, renderer_t *r,
          * making digits untappable while editing. */
         C2D_DrawRectSolid(0, (float)SET_EDITBAR_Y, 0.06f, 320,
                           (float)SET_EDITBAR_H,
-                          rgba_to_c2d_(COL_CANDIDATE_BG));
+                          rgba_to_c2d(COL_CANDIDATE_BG));
         char title[48];
         snprintf(title, sizeof(title), "%s:",
                  set_field_label((settings_field_t)kb->set_edit));

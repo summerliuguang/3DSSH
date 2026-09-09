@@ -47,6 +47,7 @@ void terminal_free(terminal_t *t) {
 }
 
 void terminal_reset(terminal_t *t) {
+    t->gen++;
     t->cur_x = 0; t->cur_y = 0;
     t->cur_fg = DEFAULT_FG; t->cur_bg = DEFAULT_BG; t->cur_flags = 0;
     t->scroll_top = 0; t->scroll_bottom = t->rows - 1;
@@ -200,7 +201,13 @@ static void handle_csi(terminal_t *t, char final, const char *param_str) {
     if (*p) {
         char tmp[256];
         int tmplen = 0;
-        while (*p && tmplen < 254) tmp[tmplen++] = *p++;
+        while (*p && tmplen < 254) {
+            /* Normalize xterm's colon-separated sub-parameters
+             * (SGR 38:5:n / 38:2:r:g:b) to semicolons so strtol sees
+             * regular params instead of stopping at the ':'. */
+            tmp[tmplen++] = (*p == ':') ? ';' : *p;
+            p++;
+        }
         tmp[tmplen] = '\0';
         char *tok = tmp, *end;
         while (*tok && nparams < 32) {
@@ -437,6 +444,7 @@ static int utf8_decode(const char *s, int len, uint32_t *cp) {
 /* ── メインパーサー ── */
 void terminal_write_n(terminal_t *t, const char *data, int len) {
     t->sb_offset = 0;  /* 新データ受信時はスクロールをリセット */
+    t->gen++;          /* display content will change */
     int i = 0;
     while (i < len) {
         unsigned char c = (unsigned char)data[i];
@@ -546,6 +554,7 @@ void terminal_write(terminal_t *t, const char *data) {
 }
 
 void terminal_scroll_view(terminal_t *t, int delta) {
+    t->gen++;              /* the visible rows move */
     t->sb_offset += delta;
     if (t->sb_offset < 0) t->sb_offset = 0;
     if (t->sb_offset > t->sb_size) t->sb_offset = t->sb_size;
@@ -568,6 +577,24 @@ term_cell_t terminal_get_cell(terminal_t *t, int x, int y) {
         term_cell_t e={0,DEFAULT_FG,DEFAULT_BG,0}; return e;
     }
     return t->cells[y*t->cols+x];
+}
+
+const term_cell_t *terminal_get_row(const terminal_t *t, int y) {
+    if (y < 0 || y >= t->rows) return NULL;
+    if (t->sb_offset > 0) {
+        /* Scrollback view: same combined-row mapping as get_cell. */
+        int combined = t->sb_size - t->sb_offset + y;
+        if (combined >= 0 && combined < t->sb_size) {
+            int ring = (t->sb_head - t->sb_size + combined + TERM_SCROLLBACK)
+                     % TERM_SCROLLBACK;
+            return &t->scrollback[ring * t->cols];
+        }
+        int cell_y = combined - t->sb_size;
+        if (cell_y >= 0 && cell_y < t->rows)
+            return &t->cells[cell_y * t->cols];
+        return NULL;
+    }
+    return &t->cells[y * t->cols];
 }
 
 int terminal_take_response(terminal_t *t, char *buf, int len) {

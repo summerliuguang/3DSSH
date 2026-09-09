@@ -211,6 +211,23 @@ static LIBSSH2_SESSION *dial_session(const char *host, int port,
     return session;
 }
 
+/* Tear down everything finish_shell may have created, in the right
+ * order.  Shared by all of its failure branches. */
+static void finish_shell_fail(LIBSSH2_SESSION *session, LIBSSH2_CHANNEL *channel,
+                              const char *reason, int sock,
+                              ts3ds_conn *tailscale_conn,
+                              ssh_transport *transport,
+                              char *err_buf, int err_sz) {
+    if (channel) {
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
+    }
+    libssh2_session_disconnect(session, reason);
+    libssh2_session_free(session);
+    close_pending_transport(sock, tailscale_conn, transport);
+    libssh2_exit();
+}
+
 /* Post-auth: open the session channel, PTY + shell, flip back to
  * non-blocking, enable keepalives, allocate the client handle.  On failure
  * tears down session + transport + libssh2 and returns NULL. */
@@ -222,10 +239,8 @@ static ssh_client_t *finish_shell(LIBSSH2_SESSION *session, int sock,
     LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
     if (!channel) {
         copy_libssh2_err(err_buf, err_sz, session, "channel_open", -1);
-        libssh2_session_disconnect(session, "channel failed");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
+        finish_shell_fail(session, channel, "channel failed", sock,
+                          tailscale_conn, transport, err_buf, err_sz);
         return NULL;
     }
 
@@ -237,24 +252,16 @@ static ssh_client_t *finish_shell(LIBSSH2_SESSION *session, int sock,
         NULL, 0, pty_cols, pty_rows, 0, 0);
     if (pty_rc != 0) {
         copy_libssh2_err(err_buf, err_sz, session, "pty", pty_rc);
-        libssh2_channel_close(channel);
-        libssh2_channel_free(channel);
-        libssh2_session_disconnect(session, "pty failed");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
+        finish_shell_fail(session, channel, "pty failed", sock,
+                          tailscale_conn, transport, err_buf, err_sz);
         return NULL;
     }
 
     int sh_rc = libssh2_channel_shell(channel);
     if (sh_rc != 0) {
         copy_libssh2_err(err_buf, err_sz, session, "shell", sh_rc);
-        libssh2_channel_close(channel);
-        libssh2_channel_free(channel);
-        libssh2_session_disconnect(session, "shell failed");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
+        finish_shell_fail(session, channel, "shell failed", sock,
+                          tailscale_conn, transport, err_buf, err_sz);
         return NULL;
     }
 
@@ -270,12 +277,8 @@ static ssh_client_t *finish_shell(LIBSSH2_SESSION *session, int sock,
     ssh_client_t *ssh = calloc(1, sizeof(*ssh));
     if (!ssh) {
         copy_err(err_buf, err_sz, "out of memory");
-        libssh2_channel_close(channel);
-        libssh2_channel_free(channel);
-        libssh2_session_disconnect(session, "oom");
-        libssh2_session_free(session);
-        close_pending_transport(sock, tailscale_conn, transport);
-        libssh2_exit();
+        finish_shell_fail(session, channel, "oom", sock,
+                          tailscale_conn, transport, err_buf, err_sz);
         return NULL;
     }
 

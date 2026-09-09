@@ -388,23 +388,27 @@ int ai_modal_visible(const ai_modal_t *m) {
 #define MODAL_TEXT_Z 0.62f
 
 /* Render the markdown-transformed doc inside the answer area, applying
- * per-byte style colours.  Walks codepoint-by-codepoint, hard-wrapping
- * at INNER_W and yielding one rendered codepoint at a time so we can
- * mix colours within a single visual row (e.g. "press . to toggle"
- * where `.` is highlighted as inline code).
+ * per-byte style colours.  Hard-wraps at INNER_W.
+ *
+ * Consecutive same-style bytes are gathered into ONE draw call per run:
+ * styles only change at markdown boundaries, so a typical line is a
+ * single call instead of ~48 per-codepoint calls.  Per-byte styles are
+ * assigned in lockstep with their codepoint, so runs never split a
+ * UTF-8 glyph mid-way.
  *
  * Returns 1 if the doc was truncated (didn't fit in the answer area)
  * so the caller can append a "..." indicator. */
 static int draw_md_doc(const md_doc_t *doc, int alpha_x256) {
+    /* Max codepoints on one visual row = INNER_W / 6px = 48, ×4 UTF-8
+     * bytes each — 224 can never overflow. */
+    char run[224];
     int x = INNER_X;
     int y = ANSWER_Y;
 
     int i = 0;
     while (i < doc->len) {
-        char c = doc->text[i];
-
         /* Hard line break — newline in the source. */
-        if (c == '\n') {
+        if (doc->text[i] == '\n') {
             x = INNER_X;
             y += LINE_H;
             if (y + 12 > ANSWER_BOTTOM) return 1;   /* truncated */
@@ -412,39 +416,40 @@ static int draw_md_doc(const md_doc_t *doc, int alpha_x256) {
             continue;
         }
 
-        /* Decode one UTF-8 codepoint to know its visual width. */
-        uint32_t cp;
-        int adv = u8_next(doc->text + i, &cp);
-        int cw  = cp_pixel_width(cp);
+        /* Gather the longest same-style run that fits on the current
+         * visual row, wrapping whole codepoints exactly like the old
+         * per-codepoint loop did. */
+        md_style_t s = (md_style_t)doc->style[i];
+        uint32_t rgba = alpha_scale(color_for_style(s), alpha_x256);
+        int run_bytes = 0;
+        int run_w = 0;
+        int end = i;
+        while (end < doc->len && doc->text[end] != '\n' &&
+               (md_style_t)doc->style[end] == s) {
+            uint32_t cp;
+            int adv = u8_next(doc->text + end, &cp);
+            int cw = cp_pixel_width(cp);
+            if (x + run_w + cw > INNER_X + INNER_W) break;   /* soft wrap */
+            if (run_bytes + adv >= (int)sizeof(run) - 1) break;
+            memcpy(run + run_bytes, doc->text + end, (size_t)adv);
+            run_bytes += adv;
+            run_w += cw;
+            end += adv;
+        }
 
-        /* Soft wrap — codepoint won't fit on the current visual row. */
-        if (x + cw > INNER_X + INNER_W) {
+        if (run_bytes == 0) {
+            /* The run's first codepoint doesn't fit on this row — wrap
+             * first and re-gather from the new line. */
             x = INNER_X;
             y += LINE_H;
             if (y + 12 > ANSWER_BOTTOM) return 1;
+            continue;
         }
 
-        /* Render the single codepoint with the colour mapped from its
-         * (per-byte) style attribute, alpha-modulated by the modal's
-         * current animation phase.  We have to do this per codepoint
-         * because adjacent bytes can have different styles (e.g. the
-         * boundary of inline code).  Performance-wise, on a typical
-         * answer ~600 codepoints × one draw call each is well within
-         * citro2d's per-frame budget. */
-        md_style_t s = (md_style_t)doc->style[i];
-        uint32_t rgba = alpha_scale(color_for_style(s), alpha_x256);
-
-        /* Build a tiny NUL-terminated string for renderer_draw_text_px_z.
-         * adv is at most 4 bytes for a UTF-8 codepoint, so 8 is plenty. */
-        char one[8];
-        int n = adv;
-        if (n > 4) n = 4;
-        memcpy(one, doc->text + i, (size_t)n);
-        one[n] = 0;
-        renderer_draw_text_px_z(x, y, MODAL_TEXT_Z, one, rgba);
-
-        x += cw;
-        i += adv;
+        run[run_bytes] = 0;
+        renderer_draw_text_px_z(x, y, MODAL_TEXT_Z, run, rgba);
+        x += run_w;
+        i = end;
     }
     return 0;
 }

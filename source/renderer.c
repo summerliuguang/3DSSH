@@ -3,31 +3,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Terminal offscreen-cache switch (make DSSH_TERMINAL_CACHE=0 to
+ * disable).  See the file comment below for what it does. */
+#ifndef DSSH_TERMINAL_CACHE
+#define DSSH_TERMINAL_CACHE 1
+#endif
+
 /*
  * citro2d-based terminal renderer (forked from skmtrd/3dssh, with the touch
- * keyboard portions removed — those will live in M4's softkb.c).
+ * keyboard portions removed — those live in softkb.c).
  *
- * Two-pass terminal draw:
+ * Terminal draw, two passes over the cell grid (66×24 = 1584 cells):
  *   pass 1  background rects per cell + cursor
  *   pass 2  glyph bitmaps blitted as 1-pixel-tall horizontal runs of
  *           C2D_DrawRectSolid; no texture atlas, just stamping pixels.
  *
- * Why pixel runs and not a texture: avoids the cost/complexity of uploading
- * texture atlases at startup; ARM11 GPU can handle thousands of solid rects
- * per frame easily and we're drawing ~1320 cells × ~10 lit pixels avg per
- * glyph at 60fps. Plenty of headroom.
+ * Pixel runs cost ~10-30 draw calls per glyph (~12k rects for a full
+ * screen), which is fine for the GPU but too much CPU to repeat every
+ * frame.  Since the terminal only changes when bytes arrive or the user
+ * scrolls, DSSH_TERMINAL_CACHE (default on) renders the grid into a
+ * VRAM texture on change and blits that texture every frame instead;
+ * idle frames drop from ~12k rects to one.  Define it to 0 for the
+ * direct path (also the automatic fallback if the texture/RT alloc
+ * fails).  A full glyph texture atlas would cut the rect count further
+ * and remains future work.
  */
-
-/* Raw passthrough — neovim sends exact 24-bit RGB via SGR-truecolor;
- * trust those colours and let the LCD render them as-is.  An earlier
- * "punch" gain was found to wash dark blues into greys and lift bright
- * blues toward white, defeating the user's colourscheme. */
-static u32 rgba_to_c2d(uint32_t rgba) {
-    return C2D_Color32((rgba >> 24) & 0xff,
-                       (rgba >> 16) & 0xff,
-                       (rgba >>  8) & 0xff,
-                        rgba        & 0xff);
-}
 
 /* Walk a 1bpp layer (FA_CELL_H bytes) and paint contiguous lit runs as
  * solid 1×1-row rects in the given C2D-format colour.  Factored out so
@@ -107,10 +107,39 @@ renderer_t *renderer_init(C3D_RenderTarget *top, C3D_RenderTarget *bot) {
     r->bot = bot;
     r->top_cols = R_TOP_COLS;
     r->top_rows = R_TOP_ROWS;
+
+#if DSSH_TERMINAL_CACHE
+    if (C3D_TexInitVRAM(&r->term_tex, 400, 240, GPU_RGBA8)) {
+        r->term_rt = C3D_RenderTargetCreateFromTex(&r->term_tex,
+                                                   GPU_TEXFACE_2D, 0,
+                                                   GPU_RB_DEPTH16);
+        if (r->term_rt) {
+            r->term_subtex.width  = 400;
+            r->term_subtex.height = 240;
+            r->term_subtex.left   = 0.0f;
+            r->term_subtex.top    = 0.0f;
+            r->term_subtex.right  = 1.0f;
+            r->term_subtex.bottom = 1.0f;
+            r->cache_ok = 1;
+        } else {
+            C3D_TexDelete(&r->term_tex);
+        }
+    }
+    /* cache_ok stays 0 on failure — the direct path is the fallback. */
+#endif
     return r;
 }
 
-void renderer_free(renderer_t *r) { free(r); }
+void renderer_free(renderer_t *r) {
+    if (!r) return;
+#if DSSH_TERMINAL_CACHE
+    if (r->cache_ok) {
+        C3D_RenderTargetDelete(r->term_rt);
+        C3D_TexDelete(&r->term_tex);
+    }
+#endif
+    free(r);
+}
 
 /* Cursor style: invert fg/bg of the cell at term->cur_x/cur_y.  This is
  * the xterm/iTerm/alacritty default — fully opaque, never leaves
@@ -122,17 +151,21 @@ static inline int cell_is_cursor(const terminal_t *t, int x, int y) {
     return t->cursor_visible && x == t->cur_x && y == t->cur_y;
 }
 
-void renderer_draw_terminal(renderer_t *r, terminal_t *term) {
-    if (!r || !term) return;
-
+/* The two-pass cell painter, used both for the direct path and for
+ * re-filling the offscreen cache.  Each display row is mapped once via
+ * terminal_get_row (rows are contiguous in both the live grid and the
+ * scrollback ring) instead of re-doing the ring math per cell. */
+static void draw_terminal_cells(renderer_t *r, terminal_t *term) {
     int cols = (term->cols < r->top_cols) ? term->cols : r->top_cols;
     int rows = (term->rows < r->top_rows) ? term->rows : r->top_rows;
     float cw = FONT_CELL_W, ch = FONT_CELL_H;
 
     /* pass 1: backgrounds (with cursor cell painted using fg color) */
     for (int y = 0; y < rows; y++) {
+        const term_cell_t *row = terminal_get_row(term, y);
+        if (!row) continue;
         for (int x = 0; x < cols; x++) {
-            term_cell_t c = terminal_get_cell(term, x, y);
+            term_cell_t c = row[x];
             float fx = x * cw, fy = y * ch;
             uint32_t bg_rgba;
             int draw_bg;
@@ -154,8 +187,10 @@ void renderer_draw_terminal(renderer_t *r, terminal_t *term) {
 
     /* pass 2: glyphs (cursor cell glyph drawn in bg color) */
     for (int y = 0; y < rows; y++) {
+        const term_cell_t *row = terminal_get_row(term, y);
+        if (!row) continue;
         for (int x = 0; x < cols; x++) {
-            term_cell_t c = terminal_get_cell(term, x, y);
+            term_cell_t c = row[x];
             if (c.flags & CELL_FLAG_WIDE_CONT) continue;
             if (c.codepoint <= 0x20) continue;
             u32 fg = cell_is_cursor(term, x, y)
@@ -174,6 +209,31 @@ void renderer_draw_terminal(renderer_t *r, terminal_t *term) {
             }
         }
     }
+}
+
+void renderer_draw_terminal(renderer_t *r, terminal_t *term) {
+    if (!r || !term) return;
+
+#if DSSH_TERMINAL_CACHE
+    if (r->cache_ok) {
+        /* Re-render only when this terminal's display generation differs
+         * from what the cache holds (covers byte input, resets,
+         * scrollback moves and window switches). */
+        if (r->cached_term != term || r->cached_gen != term->gen) {
+            C2D_TargetClear(r->term_rt, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
+            C2D_SceneBegin(r->term_rt);
+            draw_terminal_cells(r, term);
+            r->cached_term = term;
+            r->cached_gen  = term->gen;
+        }
+        /* Back to the caller's scene, then blit the cached frame. */
+        C2D_SceneBegin(r->top);
+        C2D_Image img = { &r->term_tex, &r->term_subtex };
+        C2D_DrawImageAt(img, 0, 0, 0.0f, NULL, 1.0f, 1.0f);
+        return;
+    }
+#endif
+    draw_terminal_cells(r, term);
 }
 
 /* Pull one UTF-8 codepoint from *s, advance *s past it.  Bytes that

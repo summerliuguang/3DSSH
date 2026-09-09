@@ -67,6 +67,12 @@ typedef struct terminal_t {
     int mouse_proto;   /* 0 = off; otherwise 1000/1002/1003 (last set wins) */
     int mouse_sgr;     /* ESC[?1006h: encode as SGR (\x1b[<...M) */
 
+    /* Display generation — bumped by every operation that can change
+     * what the screen looks like (byte input, reset, scrollback view
+     * move).  Lets a renderer cache the rendered frame and re-render
+     * only when the generation differs. */
+    uint32_t gen;
+
     /* Replies requested by the remote terminal application (for example
      * CSI 6n cursor-position reports used by fish's line editor).  The main
      * loop drains this buffer back into the SSH channel after parsing input. */
@@ -86,6 +92,11 @@ void        terminal_write_n(terminal_t *term, const char *data, int len);
 void        terminal_reset(terminal_t *term);
 void        terminal_scroll_view(terminal_t *term, int delta);
 term_cell_t terminal_get_cell(terminal_t *term, int x, int y);
+/* Row-pointer variant for renderers: returns a pointer to the `cols`
+ * contiguous cells of display row `y` (scrollback-aware), or NULL when
+ * `y` is off-screen.  Avoids re-doing the scrollback ring mapping for
+ * every single cell of a row. */
+const term_cell_t *terminal_get_row(const terminal_t *term, int y);
 
 /* Copy and consume queued terminal-protocol replies. Returns bytes copied. */
 int terminal_take_response(terminal_t *term, char *buf, int len);

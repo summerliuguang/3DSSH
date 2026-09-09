@@ -14,10 +14,28 @@
 #define R_BOT_COLS  (320 / FONT_CELL_W)
 #define R_BOT_ROWS  (240 / FONT_CELL_H)
 
+/* Raw passthrough — neovim sends exact 24-bit RGB via SGR-truecolor;
+ * trust those colours and let the LCD render them as-is.  An earlier
+ * "punch" gain was found to wash dark blues into greys and lift bright
+ * blues toward white, defeating the user's colourscheme. */
+static inline u32 rgba_to_c2d(uint32_t rgba) {
+    return C2D_Color32((rgba >> 24) & 0xff,
+                       (rgba >> 16) & 0xff,
+                       (rgba >>  8) & 0xff,
+                        rgba        & 0xff);
+}
+
 typedef struct renderer_t {
     C3D_RenderTarget *top;
     C3D_RenderTarget *bot;
     int top_cols, top_rows;
+    /* Terminal offscreen cache (see renderer.c). */
+    C3D_RenderTarget *term_rt;      /* render target bound to term_tex   */
+    C3D_Tex           term_tex;     /* VRAM texture the terminal draws in */
+    Tex3DS_SubTexture term_subtex;
+    const terminal_t *cached_term;  /* which terminal the cache holds     */
+    uint32_t          cached_gen;   /* terminal generation at cache time  */
+    int               cache_ok;
 } renderer_t;
 
 renderer_t *renderer_init(C3D_RenderTarget *top, C3D_RenderTarget *bot);
