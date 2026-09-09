@@ -62,7 +62,10 @@ static void set_str(char *dst, const char *src) {
 /* Default voice-transcription endpoint, injectable at build time so the
  * binary works out of the box with a personal STT server (e.g. mimo-
  * voice-hub /api/stt) without baking LAN addresses into the repo:
- *   make DSSH_VOICE_API_DEFAULT=https://192.168.x.x:29006/api/stt
+ *   make DSSH_VOICE_API_DEFAULT=http://192.168.x.x:29016/api/stt
+ * NOTE: use plain http:// for 3DS clients — the 3DS system HTTP stack
+ * maxes out at TLS 1.0 (old models / firmware), which modern nginx
+ * refuses (TLS 1.2+), so https:// endpoints fail the handshake on-device.
  * An explicitly empty value in config.ini still falls back to the SSH
  * shim transport. */
 #ifndef DSSH_VOICE_API_DEFAULT

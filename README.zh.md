@@ -311,8 +311,12 @@ session 的第二个 channel** 上传（零新端口、零新认证、零防火�
 里的 `text` 字段就是转写结果。设置页或 config.ini 里配置：
 
 ```ini
-voice_api_url = https://192.0.2.10:29006/api/stt
+voice_api_url = http://192.0.2.10:29016/api/stt
 ```
+
+> **务必用 http:// 而不是 https://**：3DS 系统 HTTP 模块最高只支持
+> TLS 1.0（老机型/老固件），现代 nginx 只收 TLS 1.2+，https 端点在
+> 3DS 上必然握手失败（界面报 ERR、请求根本到不了服务器）。
 
 - 转出文字直接打进终端（与 shim 轨相同的打字机效果），编辑框场景
   下效果等同于"语音输入到输入框"
@@ -322,7 +326,7 @@ voice_api_url = https://192.0.2.10:29006/api/stt
   DeepSeek）
 - 设置页 SAVE 后立即生效；debug 页显示当前 `VOICE: HTTP API / SSH shim`
 - 编译期可把局域网端点烘焙成默认值（不进仓库）：
-  `make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt`
+  `make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt`
 - 本机参考服务端：`~/web-projects/mimo-voice-hub` 的 `/api/stt`
   （小米 MiMo ASR；浏览器配套快速页 `/stt`，麦克风说话直接出文字）
   ——拒绝认证等错误会以 `ERR` 提示，响应体也会留在 debug 页 hex 里
@@ -537,7 +541,7 @@ dssh-whisper switch         # 不带参数即 toggle
 | **B** | Backspace / 消拼音 buffer | hold-style 自动重复（最快 60/秒） |
 | **X** | Alt 修饰 | hold-style，按住时下次按键加 Alt |
 | **Y** | Ctrl 修饰 | hold-style，按住 Y + 点 c → Ctrl-C |
-| **L** | Shift 修饰 / **+ Circle Pad → 切右窗格** | 见下面 [tmux 窗格滚动](#tmux-分屏滚动) |
+| **L** | Shift 修饰 / **+ Circle Pad → 切左/上窗格** | 见下面 [滚轮事件目标](#滚轮事件的目标位置tmux-分屏--全屏-tui) |
 | **R** | 切换中/英输入模式 | 右上 ENG/CHN 显示当前模式 |
 | **SELECT** | Esc | 单点立即发 |
 | **START** | **语音输入开关** | 一按开始录音、再按结束并转写。详见 [语音输入](#语音输入)。 |
@@ -549,16 +553,18 @@ dssh-whisper switch         # 不带参数即 toggle
 
 > 长按 D-pad 或 B 键：250ms 启动重复，0.5s 后 12/秒，1.5s 后冲到 60/秒。
 
-### tmux 分屏滚动
+### 滚轮事件的目标位置（tmux 分屏 / 全屏 TUI）
 
-3DS 没有真正的鼠标光标，tmux 的 mouse-wheel 事件按 (col, row) 路由到对应
-窗格。DSSH 默认发 `(1,1)` 命中**左/上窗格**；按住 **L** 时改发 `(60,12)`
-命中**右/下窗格**。所以 vertical-split tmux 里：
+3DS 没有真正的鼠标光标，鼠标上报型程序（tmux、opencode 等 TUI）把
+wheel 事件按 (col, row) 路由到对应区域。DSSH 默认发**屏幕中央**
+`(40,15)`——全屏 TUI（opencode、htop、less…）的可滚动内容都在中部，
+发左上角会被标题栏吞掉、滚不动；按住 **L** 改发 `(1,1)`，命中 tmux
+分屏时的**左/上窗格**：
 
 | 操作 | 效果 |
 |---|---|
-| Circle Pad ↑↓ | 滚动**左**窗格 |
-| L 按住 + Circle Pad ↑↓ | 滚动**右**窗格 |
+| Circle Pad ↑↓ | 滚动中央区域（全屏 TUI 的主内容 / tmux 默认窗格） |
+| L 按住 + Circle Pad ↑↓ | 滚动 tmux 分屏的**左/上窗格** |
 
 ### 软键盘
 
@@ -711,7 +717,7 @@ python3 tools/gen_pinyin_dict.py
 
 # 8. 编译 .3dsx（可选：把局域网 STT 端点烘焙成默认语音后端；
 #    LAN 地址只在编译期注入，不进仓库）
-make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
+make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt
 
 # 9. （可选）打 .cia
 bash tools/install_cia_tools.sh   # 装 bannertool + makerom 到 ~/bin

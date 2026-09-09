@@ -384,8 +384,11 @@ static int dbg_toggle_hit(int tx, int ty) {
 #define SET_SAVE_W      84
 #define SET_RECONN_X    98
 #define SET_RECONN_W   126
-#define SET_EDITBAR_Y  40
-#define SET_EDITBAR_H  34
+/* Edit bar occupies the status row's band (y 0..34) so the keyboard
+ * grid (y 36..) stays fully tappable while editing — see
+ * draw_settings_screen for why this matters. */
+#define SET_EDITBAR_Y  0
+#define SET_EDITBAR_H  STATUS_H
 
 static int setbtn_hit(int tx, int ty) {
     return tx >= SETBTN_X && tx < SETBTN_X + SETBTN_W &&
@@ -1096,8 +1099,15 @@ static void draw_status_row(softkb_t *kb, renderer_t *r,
                               (float)slot_w, (float)slot_h,
                               rgba_to_c2d_(voice_bg));
         }
-        int vx = 2 + (slot_w - label_tw) / 2;
-        renderer_draw_text_px(vx, label_y, voice_lbl, voice_fg);
+        if (strlen(voice_lbl) > 3) {
+            /* Surfaced error reason (e.g. "open ctx 0x…") — left-align
+             * into the candidate strip; centered in the 22 px slot it
+             * overflows and is unreadable. */
+            renderer_draw_text_px(strip_x, label_y, voice_lbl, voice_fg);
+        } else {
+            int vx = 2 + (slot_w - label_tw) / 2;
+            renderer_draw_text_px(vx, label_y, voice_lbl, voice_fg);
+        }
     } else if (kbd_active) {
         /* Highlight overlay: faint blue tint behind the active label. */
         C2D_DrawRectSolid(2, (float)slot_y, 0.072f,
@@ -1283,10 +1293,14 @@ static void draw_settings_screen(softkb_t *kb, renderer_t *r,
                                  const keyboard_t *kbd) {
     C2D_DrawRectSolid(0, 0, 0.05f, 320, 240,
                       rgba_to_c2d_(COL_STATUS_BG));
-    draw_status_row(kb, r, kbd);
 
-    /* ── Edit mode: field bar + keyboard pages ── */
+    /* ── Edit mode: field bar (replaces the status row) + keyboard ── */
     if (kb->set_edit >= 0) {
+        /* The edit bar takes over y 0..34 (the status row's band) so the
+         * keyboard keeps its full y=36.. grid.  It used to sit at y=40,
+         * covering keyboard row 0 — the symbols page's digit row — and
+         * the bar's commit-tap zone swallowed every tap on those keys,
+         * making digits untappable while editing. */
         C2D_DrawRectSolid(0, (float)SET_EDITBAR_Y, 0.06f, 320,
                           (float)SET_EDITBAR_H,
                           rgba_to_c2d_(COL_CANDIDATE_BG));
@@ -1299,13 +1313,15 @@ static void draw_settings_screen(softkb_t *kb, renderer_t *r,
         draw_value_clipped(6 + renderer_utf8_text_width_px(title) + 4,
                            SET_EDITBAR_Y + 3, kb->set_edit_buf,
                            320 - 24, COL_KEY_LABEL);
-        renderer_draw_text_px(6, SET_EDITBAR_Y + 18,
-                              "A=ok   B=del   SELECT=cancel   tap bar=ok",
+        renderer_draw_text_px(6, SET_EDITBAR_Y + 20,
+                              "A=ok  B=del  SELECT=cancel  tap bar=ok",
                               COL_STATUS_DIM);
 
         draw_keyboard_keys(kb);
         return;
     }
+
+    draw_status_row(kb, r, kbd);
 
     /* ── Browse mode ── */
     renderer_draw_text_px(6, SET_TITLE_Y, "SETTINGS", COL_STATUS_FG_HOLD);

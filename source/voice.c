@@ -34,16 +34,18 @@
 #define MIC_BUFFER_SIZE    (1024 * 1024)
 #define MIC_BUFFER_ALIGN   0x1000
 #define MAX_RECORD_FRAMES  (60 * 30)
-#define ERROR_DECAY_FRAMES 120
+/* 6 s so the surfaced error reason stays readable on the small screen. */
+#define ERROR_DECAY_FRAMES 360
 #define MIN_PCM_BYTES      4096
 #define WRITE_CHUNK_BYTES  4096
 #define REPLY_BUF_SIZE     8192       /* AI JSON envelopes are bigger */
 
-/* HTTP-API transcribe cap: after 20 s of no response we give up and reap
- * the worker thread (release_aux joins it — bounded by the 3DS HTTP
- * service's own timeouts).  Keeps the spinner from spinning forever when
- * a server is reachable but unresponsive. */
-#define HTTP_TIMEOUT_FRAMES (60 * 20)
+/* HTTP-API transcribe cap: MiMo ASR takes 5-15 s depending on clip
+ * length, so 20 s cut long utterances short — allow 45 s of no response
+ * before we give up and reap the worker thread (release_aux joins it —
+ * bounded by the 3DS HTTP service's own timeouts).  Keeps the spinner
+ * from spinning forever when a server is reachable but unresponsive. */
+#define HTTP_TIMEOUT_FRAMES (60 * 45)
 
 #define AI_HISTORY_MAX     5
 #define AI_Q_MAX           512
@@ -982,7 +984,10 @@ const char *voice_status_label(const voice_t *v) {
         case VOICE_TYPING:
             return spinner_frame(v->state_frame);
         case VOICE_ERROR:
-            return "ERR";
+            /* Surface the concrete reason (mic init failed / open ctx
+             * 0x… / http timeout …) — the bare ERR badge made voice
+             * failures undiagnosable.  Falls back to ERR if empty. */
+            return v->err_msg[0] ? v->err_msg : "ERR";
         default:
             return NULL;
     }

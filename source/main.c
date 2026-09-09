@@ -164,10 +164,21 @@ static int net_init(char *err, int err_sz) {
         snprintf(err, err_sz, "socInit 0x%08lX", (unsigned long)rc);
         return -1;
     }
+    /* httpc is its own sysmodule — socInit does NOT cover it.  Without
+     * httpcInit every httpcOpenContext fails outright, which is why the
+     * voice ERR badge appeared before any request hit the wire.  The
+     * sharedmem holds the POST upload buffer: size it for a full mic
+     * capture (~1 MB WAV), 0x1000-aligned per libctru docs. */
+    rc = httpcInit(2 * 1024 * 1024);
+    if (rc != 0) {
+        snprintf(err, err_sz, "httpcInit 0x%08lX", (unsigned long)rc);
+        return -1;
+    }
     return 0;
 }
 
 static void net_fini(void) {
+    httpcExit();
     socExit();
     if (soc_buf) { free(soc_buf); soc_buf = NULL; }
 }

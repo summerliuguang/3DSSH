@@ -345,8 +345,13 @@ mono WAV; the JSON response's `text` field is the transcription.
 Configure it in SETTINGS or config.ini:
 
 ```ini
-voice_api_url = https://192.0.2.10:29006/api/stt
+voice_api_url = http://192.0.2.10:29016/api/stt
 ```
+
+> **Use http://, not https://**: the 3DS system HTTP stack maxes out at
+> TLS 1.0 (old models / firmware) while modern nginx only accepts
+> TLS 1.2+, so an https endpoint fails the handshake on-device (ERR
+> badge, request never reaches the server).
 
 - Transcribed text is typed into the terminal with the same typewriter
   effect — effectively "voice into the input box"
@@ -358,7 +363,7 @@ voice_api_url = https://192.0.2.10:29006/api/stt
 - Takes effect immediately after SETTINGS SAVE; the debug page shows
   `VOICE: HTTP API / SSH shim`
 - Bake a LAN endpoint in as the compiled default (kept out of the
-  repo): `make DSSH_VOICE_API_DEFAULT=https://server:29006/api/stt`
+  repo): `make DSSH_VOICE_API_DEFAULT=http://server:29016/api/stt`
 - Reference server: mimo-voice-hub's `/api/stt` (Xiaomi MiMo ASR), with
   a browser quick page at `/stt` that drives the same endpoint
 
@@ -590,7 +595,7 @@ dssh-whisper switch         # no arg = toggle
 | **B** | Backspace / consume one pinyin letter | Hold-style auto-repeat (peaks at 60 / sec) |
 | **X** | Alt modifier | Hold-style — held when the next key fires |
 | **Y** | Ctrl modifier | Hold-style — Y + tap `c` → Ctrl-C |
-| **L** | Shift modifier / **+ Circle Pad → right pane** | See [tmux split scrolling](#tmux-split-scrolling) below |
+| **L** | Shift modifier / **+ Circle Pad → top-left pane** | See [mouse-wheel target](#mouse-wheel-target-tmux-splits--full-screen-tuis) below |
 | **R** | Toggle CN/EN input mode | Top-right ENG/CHN reflects the current mode |
 | **SELECT** | Esc | Tap fires immediately |
 | **START** | **Voice input toggle** | Press once to start recording; press again to stop and transcribe.  See [Voice input](#voice-input). |
@@ -598,22 +603,24 @@ dssh-whisper switch         # no arg = toggle
 | **Shift + .** | **。** (full-width Chinese period, U+3002) | Works in both EN and CN modes |
 | **D-pad ↑↓** | Arrow keys / IME page nav | When the IME buffer is active, ↑↓ paginates candidates |
 | **D-pad ←→** | Arrow keys / IME selection cursor | When active, ←→ moves the candidate cursor within the page |
-| **Circle Pad ↑↓** | Scrollback / tmux mouse-wheel | Default targets the left/top pane; **hold L → right/bottom pane** |
+| **Circle Pad ↑↓** | Scrollback / mouse-wheel for reporting TUIs | Default targets **screen center** (opencode / htop / less); **hold L → top-left pane** (tmux splits) |
 
 > Long-press D-pad or B: 250 ms initial delay, ramps up to 12 / sec at
 > 0.5 s, peaks at 60 / sec after 1.5 s.
 
-### tmux split scrolling
+### Mouse-wheel target (tmux splits / full-screen TUIs)
 
-The 3DS has no real cursor, so tmux's mouse-wheel events get routed by
-the `(col, row)` we send.  DSSH defaults to `(1, 1)` → hits the
-left/top pane; holding **L** sends `(60, 12)` → hits the right/bottom
-pane.  In a vertical-split tmux:
+The 3DS has no real cursor, so mouse-reporting programs (tmux,
+opencode, ...) route wheel events by the `(col, row)` we send.  DSSH
+defaults to **screen center** `(40, 15)` — full-screen TUIs keep their
+scrollable transcript there, while `(1, 1)` is a title/header bar that
+swallows the event.  Holding **L** sends `(1, 1)` → the **left/top
+pane** of a tmux split:
 
 | Action | Effect |
 |---|---|
-| Circle Pad ↑↓ | Scrolls the **left** pane |
-| L held + Circle Pad ↑↓ | Scrolls the **right** pane |
+| Circle Pad ↑↓ | Scrolls the center region (full-screen TUI content / default tmux pane) |
+| L held + Circle Pad ↑↓ | Scrolls the **left/top** pane of a tmux split |
 
 ### Soft keyboard
 
@@ -784,7 +791,7 @@ python3 tools/gen_pinyin_dict.py
 # 8. Build the .3dsx (optional: bake a LAN STT endpoint in as the
 #    default voice backend — injected at compile time, not stored in
 #    the repo)
-make DSSH_VOICE_API_DEFAULT=https://your-server:29006/api/stt
+make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt
 
 # 9. (Optional) build the .cia
 bash tools/install_cia_tools.sh   # installs bannertool + makerom into ~/bin

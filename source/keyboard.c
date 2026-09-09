@@ -117,13 +117,14 @@ const char *keyboard_handle_input(keyboard_t *kbd,
      *   deadband 80, sustained-push 6 frames before first event,
      *   then one event per 5 frames.
      *
-     * Pane targeting in tmux mouse mode: tmux routes wheel events to
-     * whichever pane contains the (col,row) we send.  Default (1,1)
-     * lands in the left/top pane.  Holding L (Shift modifier) shifts
-     * the target to (60,12), which lands in the right pane of a
-     * vertical split or the bottom pane of a horizontal split — the
-     * 3DS has no real cursor so this hold-style toggle is the
-     * simplest way to give both panes access without a UI mode. */
+     * Pane targeting in mouse-reporting TUIs: the wheel event is
+     * delivered to whatever component sits at the (col,row) we encode.
+     * The DEFAULT aims at screen center (40,15) of the 80x30 grid —
+     * full-screen TUIs (opencode, htop, less, ...) put their scrollable
+     * transcript there, while (1,1) is a title/header bar that swallows
+     * the event and nothing scrolls.  Holding L aims at (1,1) instead —
+     * the left/top pane of a tmux split.  The 3DS has no real cursor,
+     * so this hold-style toggle is the simplest way to reach both. */
     int scroll_active = (circle_dy > 80 || circle_dy < -80);
     if (scroll_active) {
         kbd->scroll_timer++;
@@ -133,11 +134,11 @@ const char *keyboard_handle_input(keyboard_t *kbd,
             if (term && term->mouse_proto && term->mouse_sgr) {
                 const char *seq;
                 if (kbd->shift_held) {
-                    seq = (circle_dy > 0) ? "\x1b[<64;60;12M"
-                                           : "\x1b[<65;60;12M";
-                } else {
                     seq = (circle_dy > 0) ? "\x1b[<64;1;1M"
                                            : "\x1b[<65;1;1M";
+                } else {
+                    seq = (circle_dy > 0) ? "\x1b[<64;40;15M"
+                                           : "\x1b[<65;40;15M";
                 }
                 return emit_seq(kbd, seq);
             }
