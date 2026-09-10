@@ -82,7 +82,8 @@ Everything below documents **this fork**, not upstream.
   CJK unified ideographs, Terminus 6×12 for ASCII; mixed CJK/ASCII
   baselines align cleanly on the same line.
 - **Self-drawn soft keyboard** — iOS-style 3px rounded keys with smooth
-  press-down animation; letters / symbols pages.
+  press-down animation and a key-click sound (silent when DSP firmware
+  is missing); letters / symbols pages.
 - **Pinyin input method** — top 300k entries from rime-ice, plus
   abbreviation matching (`nh` → 你好), prefix fallback (`nihaoz`
   auto-falls-back to `nihao`), and a candidate cursor.
@@ -838,6 +839,11 @@ python3 tools/gen_pinyin_dict.py
 #    default voice backend — injected at compile time, not stored in
 #    the repo)
 make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt
+
+#    Build knobs: DSSH_TERMINAL_CACHE=0 disables the terminal offscreen
+#    render cache (direct draw every frame — fallback if a target
+#    misbehaves; the cache is on by default)
+#    make DSSH_TERMINAL_CACHE=0
 
 # 9. (Optional) build the .cia
 bash tools/install_cia_tools.sh   # installs bannertool + makerom into ~/bin

@@ -74,8 +74,8 @@
   制表线边框、256 色、真彩色、盲文字符——全部正常渲染。
 - **中文渲染**：内置 Zpix 12px 像素字体（覆盖 21,000+ CJK 统一
   汉字）+ Terminus 6×12 ASCII 字体，中英混排基线对齐。
-- **自绘软键盘**：iOS 风格 3px 圆角按键，带平滑按下动画；字母 / 符号
-  两页。
+- **自绘软键盘**：iOS 风格 3px 圆角按键，带平滑按下动画和按键音效
+  （DSP 固件缺失时自动静音）；字母 / 符号两页。
 - **拼音输入法**：基于 rime-ice 前 30 万条词典，支持声母缩写
   （`nh` → 你好）、前缀回退（多打的字母自动变红）和候选词光标。
 - **物理键全映射**：D-pad 方向键，L/X/Y 为按住生效的修饰键
@@ -790,6 +790,10 @@ python3 tools/gen_pinyin_dict.py
 # 8. 编译 .3dsx（可选：把局域网 STT 端点烘焙成默认语音后端；
 #    只在编译期注入，不进仓库）
 make DSSH_VOICE_API_DEFAULT=http://your-server:29016/api/stt
+
+#    构建开关：DSSH_TERMINAL_CACHE=0 关闭终端离屏渲染缓存
+#    （回退为逐帧直绘；缓存默认开启，仅真机异常时使用）
+#    make DSSH_TERMINAL_CACHE=0
 
 # 9. （可选）打包 .cia
 bash tools/install_cia_tools.sh   # 装 bannertool + makerom 到 ~/bin
